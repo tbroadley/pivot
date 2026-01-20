@@ -15,6 +15,8 @@ from pivot.types import OutputMessage, StageStatus, TuiQueue
 if TYPE_CHECKING:
     import multiprocessing as mp
 
+    from pivot.watch.engine import WatchEngine
+
 # =============================================================================
 # ExecutionHistoryEntry Tests
 # =============================================================================
@@ -187,7 +189,7 @@ def test_tabbed_detail_panel_history_index_starts_none() -> None:
 
 
 def test_watch_tui_app_has_history_tracking_state(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """WatchTuiApp has state for tracking history navigation."""
     tui_queue: TuiQueue = queue.Queue()
@@ -197,7 +199,7 @@ def test_watch_tui_app_has_history_tracking_state(
 
 
 def test_watch_tui_app_pending_history_tracking(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """WatchTuiApp tracks pending history entries during execution."""
     tui_queue: TuiQueue = queue.Queue()
@@ -208,7 +210,7 @@ def test_watch_tui_app_pending_history_tracking(
 
 
 def test_watch_tui_app_get_current_stage_history_empty(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """_get_current_stage_history returns empty deque when no selection."""
     tui_queue: TuiQueue = queue.Queue()
@@ -219,7 +221,7 @@ def test_watch_tui_app_get_current_stage_history_empty(
 
 
 def test_watch_tui_app_get_current_stage_history_with_stage(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """_get_current_stage_history returns stage's history deque."""
     tui_queue: TuiQueue = queue.Queue()
@@ -250,7 +252,7 @@ def test_watch_tui_app_get_current_stage_history_with_stage(
 
 
 def test_finalize_history_skipped_without_pending_creates_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """Skipped stages without pending state still get history entries.
 
@@ -283,7 +285,7 @@ def test_finalize_history_skipped_without_pending_creates_entry(
 
 
 def test_finalize_history_skipped_without_run_id_does_not_create_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """Skipped stages without run_id don't get history entries (defensive)."""
     tui_queue: TuiQueue = queue.Queue()
@@ -303,7 +305,7 @@ def test_finalize_history_skipped_without_run_id_does_not_create_entry(
 
 
 def test_finalize_history_failed_without_pending_does_not_create_entry(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """Non-SKIPPED statuses without pending state don't get history entries.
 
@@ -327,7 +329,7 @@ def test_finalize_history_failed_without_pending_does_not_create_entry(
 
 
 def test_watch_tui_app_new_run_clears_stale_pending_entries(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """New run_id clears pending entries from previous run.
 
@@ -359,7 +361,7 @@ def test_watch_tui_app_new_run_clears_stale_pending_entries(
 
 
 def test_watch_tui_app_tracks_current_run_id(
-    mock_engine: run_tui.WatchEngineProtocol,
+    mock_engine: WatchEngine,
 ) -> None:
     """WatchTuiApp tracks current run_id for detecting new runs."""
     tui_queue: TuiQueue = queue.Queue()
@@ -399,6 +401,6 @@ class MockWatchEngine:
 
 
 @pytest.fixture
-def mock_engine() -> run_tui.WatchEngineProtocol:
+def mock_engine() -> WatchEngine:
     """Provide a mock watch engine."""
-    return MockWatchEngine()
+    return MockWatchEngine()  # pyright: ignore[reportReturnType] - mock for testing

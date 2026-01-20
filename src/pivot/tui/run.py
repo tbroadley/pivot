@@ -11,7 +11,19 @@ import os
 import queue
 import threading
 import time
-from typing import IO, TYPE_CHECKING, ClassVar, Literal, TypeVar, cast, final, override
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    ClassVar,
+    Literal,
+    TypedDict,
+    TypeVar,
+    final,
+    override,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 import filelock
 import rich.markup
@@ -23,6 +35,7 @@ import textual.css.query
 import textual.message
 import textual.screen
 import textual.timer
+import textual.widget
 import textual.widgets
 
 from pivot import explain, parameters, project
@@ -51,23 +64,9 @@ if TYPE_CHECKING:
     import multiprocessing as mp
     from collections.abc import Callable
     from pathlib import Path
-    from typing import Protocol
 
     from pivot.types import OutputMessage
     from pivot.watch.engine import WatchEngine
-
-    class WatchEngineProtocol(Protocol):
-        """Protocol for WatchEngine to avoid circular imports."""
-
-        def run(
-            self,
-            tui_queue: TuiQueue | None = None,
-            output_queue: mp.Queue[OutputMessage] | None = None,
-        ) -> None: ...
-        def shutdown(self) -> None: ...
-        def toggle_keep_going(self) -> bool: ...
-        @property
-        def keep_going(self) -> bool: ...
 
 
 def _format_elapsed(elapsed: float | None) -> str:
@@ -78,16 +77,64 @@ def _format_elapsed(elapsed: float | None) -> str:
     return f"({mins}:{secs:02d})"
 
 
-# Status display with colors
-STATUS_STYLES: dict[StageStatus, tuple[str, str]] = {
-    StageStatus.READY: ("PENDING", "dim"),
-    StageStatus.IN_PROGRESS: ("RUNNING", "blue bold"),
-    StageStatus.COMPLETED: ("SUCCESS", "green bold"),
-    StageStatus.RAN: ("SUCCESS", "green bold"),
-    StageStatus.SKIPPED: ("SKIP", "yellow"),
-    StageStatus.FAILED: ("FAILED", "red bold"),
-    StageStatus.UNKNOWN: ("UNKNOWN", "dim"),
-}
+def _get_status_symbol(status: StageStatus) -> tuple[str, str]:
+    """Get compact symbol and style for a status (for row display)."""
+    match status:
+        case StageStatus.READY:
+            return ("○", "dim")
+        case StageStatus.IN_PROGRESS:
+            return ("▶", "blue bold")
+        case StageStatus.COMPLETED | StageStatus.RAN:
+            return ("●", "green bold")
+        case StageStatus.SKIPPED:
+            return ("-", "yellow")
+        case StageStatus.FAILED:
+            return ("!", "red bold")
+        case StageStatus.UNKNOWN:
+            return ("?", "dim")
+
+
+def _get_status_label(status: StageStatus) -> tuple[str, str]:
+    """Get verbose label and style for a status (for detail panel)."""
+    match status:
+        case StageStatus.READY:
+            return ("PENDING", "dim")
+        case StageStatus.IN_PROGRESS:
+            return ("RUNNING", "blue bold")
+        case StageStatus.COMPLETED | StageStatus.RAN:
+            return ("SUCCESS", "green bold")
+        case StageStatus.SKIPPED:
+            return ("SKIPPED", "yellow")
+        case StageStatus.FAILED:
+            return ("FAILED", "red bold")
+        case StageStatus.UNKNOWN:
+            return ("UNKNOWN", "dim")
+
+
+class StatusCounts(TypedDict):
+    """Counts of stages by status category."""
+
+    running: int
+    completed: int
+    failed: int
+
+
+def _count_statuses(stages: Iterable[StageInfo]) -> StatusCounts:
+    """Count stages by status category."""
+    running = 0
+    completed = 0
+    failed = 0
+    for s in stages:
+        match s.status:
+            case StageStatus.IN_PROGRESS:
+                running += 1
+            case StageStatus.COMPLETED | StageStatus.RAN:
+                completed += 1
+            case StageStatus.FAILED:
+                failed += 1
+            case StageStatus.READY | StageStatus.SKIPPED | StageStatus.UNKNOWN:
+                pass  # Not counted
+    return StatusCounts(running=running, completed=completed, failed=failed)
 
 
 @dataclasses.dataclass
@@ -125,6 +172,8 @@ class StageInfo:
     name: str
     index: int
     total: int
+    base_name: str = ""  # Part before @, or full name if no @
+    variant: str = ""  # Part after @, or empty if no @
     status: StageStatus = StageStatus.READY
     reason: str = ""
     elapsed: float | None = None
@@ -134,6 +183,14 @@ class StageInfo:
     history: collections.deque[ExecutionHistoryEntry] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=50)
     )
+
+    def __post_init__(self) -> None:
+        """Compute base_name and variant from name."""
+        if "@" in self.name:
+            self.base_name, self.variant = self.name.split("@", 1)
+        else:
+            self.base_name = self.name
+            self.variant = ""
 
 
 class TuiUpdate(textual.message.Message):
@@ -160,35 +217,123 @@ class ExecutorComplete(textual.message.Message):
         super().__init__()
 
 
+class StageGroupHeader(textual.widgets.Static):
+    """Header for a group of stages with the same base name."""
+
+    _base_name: str
+    _stages: list[StageInfo]
+    _is_collapsed: bool
+    _is_selected: bool
+
+    def __init__(self, base_name: str, stages: list[StageInfo]) -> None:
+        super().__init__(classes="stage-group-header")
+        self._base_name = base_name
+        self._stages = stages
+        self._is_collapsed = False
+        self._is_selected = False
+
+    @property
+    def base_name(self) -> str:
+        return self._base_name
+
+    @property
+    def is_collapsed(self) -> bool:
+        return self._is_collapsed
+
+    def update_display(self, is_selected: bool | None = None) -> None:  # pragma: no cover
+        """Update the group header display."""
+        if is_selected is not None:
+            self._is_selected = is_selected
+
+        counts = _count_statuses(self._stages)
+
+        # Status summary (show counts for running, completed, failed)
+        status_parts = list[str]()
+        if counts["running"] > 0:
+            status_parts.append(f"[blue bold]▶{counts['running']}[/]")
+        if counts["completed"] > 0:
+            status_parts.append(f"[green bold]●{counts['completed']}[/]")
+        if counts["failed"] > 0:
+            status_parts.append(f"[red bold]!{counts['failed']}[/]")
+        status_str = " ".join(status_parts) if status_parts else ""
+
+        # Collapse indicator
+        collapse_icon = ">" if self._is_collapsed else "v"
+        arrow = "→ " if self._is_selected else "  "
+        count = len(self._stages)
+        name_escaped = rich.markup.escape(self._base_name)
+
+        text = f"{arrow}[bold]{collapse_icon}[/] {name_escaped} ({count})  {status_str}"
+        self.update(text)
+
+    def toggle_collapse(self) -> bool:  # pragma: no cover
+        """Toggle collapsed state and return new state."""
+        self._is_collapsed = not self._is_collapsed
+        return self._is_collapsed
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        """Set collapsed state."""
+        self._is_collapsed = collapsed
+
+    def on_mount(self) -> None:  # pragma: no cover
+        self.update_display()
+
+
 class StageRow(textual.widgets.Static):
     """Single stage row showing index, name, status, and reason."""
 
     _info: StageInfo
+    _is_selected: bool
 
     def __init__(self, info: StageInfo) -> None:
-        super().__init__()
+        super().__init__(classes="stage-row")
         self._info = info
+        self._is_selected = False
 
-    def update_display(self) -> None:  # pragma: no cover
-        label, style = STATUS_STYLES.get(self._info.status, ("?", "dim"))
-        index_str = f"[{self._info.index}/{self._info.total}]"
-        elapsed_str = _format_elapsed(self._info.elapsed)
-        if elapsed_str:
-            elapsed_str = f" {elapsed_str}"
-        reason_str = f"  ({rich.markup.escape(self._info.reason)})" if self._info.reason else ""
+    @property
+    def is_selected(self) -> bool:
+        """Return whether this row is selected."""
+        return self._is_selected
+
+    def update_display(self, is_selected: bool | None = None) -> None:  # pragma: no cover
+        """Update the row display. If is_selected is None, use cached value."""
+        if is_selected is not None:
+            self._is_selected = is_selected
+
+        symbol, style = _get_status_symbol(self._info.status)
+        index_str = f"{self._info.index:3}"
         name_escaped = rich.markup.escape(self._info.name)
-        text = f"{index_str} {name_escaped:<20} [{style}]{label}[/]{elapsed_str}{reason_str}"
+
+        # Format elapsed time (only for running/completed/failed)
+        elapsed_str = ""
+        if self._info.elapsed is not None and self._info.status in (
+            StageStatus.IN_PROGRESS,
+            StageStatus.COMPLETED,
+            StageStatus.RAN,
+            StageStatus.FAILED,
+        ):
+            mins, secs = divmod(int(self._info.elapsed), 60)
+            elapsed_str = f"{mins}:{secs:02d} "
+
+        # Selection arrow prefix
+        arrow = "→ " if self._is_selected else "  "
+
+        # Format: →  3  train@small              1:23 ▶
+        text = f"{arrow}{index_str}  {name_escaped:<24} {elapsed_str}[{style}]{symbol}[/]"
         self.update(text)
 
     def on_mount(self) -> None:  # pragma: no cover
         self.update_display()
 
 
-class StageListPanel(textual.widgets.Static):
-    """Panel showing all stages with their status."""
+class StageListPanel(textual.containers.VerticalScroll):
+    """Panel showing all stages with their status, with scrolling and grouping support."""
 
     _stages: list[StageInfo]
     _rows: dict[str, StageRow]
+    _group_headers: dict[str, StageGroupHeader]  # base_name -> header
+    _collapsed_groups: set[str]  # base_names of collapsed groups
+    _selected_idx: int
 
     def __init__(
         self,
@@ -200,23 +345,147 @@ class StageListPanel(textual.widgets.Static):
         super().__init__(id=id, classes=classes)
         self._stages = stages
         self._rows = {}
+        self._group_headers = {}
+        self._collapsed_groups = set()
+        self._selected_idx = 0
+
+    def _compute_groups(self) -> dict[str, list[StageInfo]]:
+        """Group stages by base_name, maintaining order."""
+        groups: dict[str, list[StageInfo]] = {}
+        for stage in self._stages:
+            if stage.base_name not in groups:
+                groups[stage.base_name] = []
+            groups[stage.base_name].append(stage)
+        return groups
 
     @override
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
-        yield textual.widgets.Static("[bold]Stages[/]", classes="section-header")
-        for stage in self._stages:
+        yield textual.widgets.Static(
+            self._format_header(), id="stages-header", classes="section-header"
+        )
+
+        groups = self._compute_groups()
+        seen_bases = set[str]()
+
+        for stage_idx, stage in enumerate(self._stages):
+            # If this is the first stage of a group with 2+ members, yield header
+            if stage.base_name not in seen_bases:
+                seen_bases.add(stage.base_name)
+                group_stages = groups[stage.base_name]
+                if len(group_stages) >= 2:
+                    header = StageGroupHeader(stage.base_name, group_stages)
+                    header.set_collapsed(stage.base_name in self._collapsed_groups)
+                    self._group_headers[stage.base_name] = header
+                    yield header
+
+            # Yield stage row (with collapsed class if in collapsed group)
             row = StageRow(stage)
+            if stage.base_name in self._collapsed_groups:
+                row.add_class("collapsed")
+            row.update_display(is_selected=(stage_idx == self._selected_idx))
             self._rows[stage.name] = row
             yield row
 
-    def update_stage(self, name: str) -> None:  # pragma: no cover
-        if name in self._rows:
-            self._rows[name].update_display()
+    def _format_header(self) -> str:  # pragma: no cover
+        """Format header with stage count and status summary."""
+        total = len(self._stages)
+        counts = _count_statuses(self._stages)
+
+        summary_parts = list[str]()
+        if counts["running"] > 0:
+            summary_parts.append(f"[blue bold]▶{counts['running']}[/]")
+        if counts["failed"] > 0:
+            summary_parts.append(f"[red bold]!{counts['failed']}[/]")
+
+        summary = " " + " ".join(summary_parts) if summary_parts else ""
+        return f"[bold]Stages ({total})[/]{summary}"
+
+    def update_header(self) -> None:  # pragma: no cover
+        """Update the header to reflect current status counts."""
+        try:
+            header = self.query_one("#stages-header", textual.widgets.Static)
+            header.update(self._format_header())
+        except textual.css.query.NoMatches:
+            pass
+
+    def update_stage(self, name: str, selected_name: str | None = None) -> None:  # pragma: no cover
+        """Update a stage row display."""
+        if name not in self._rows:
+            self.update_header()
+            return
+
+        row = self._rows[name]
+        is_selected = (name == selected_name) if selected_name else row.is_selected
+        row.update_display(is_selected=is_selected)
+
+        # Update group header if stage is in a group (single pass lookup)
+        for stage in self._stages:
+            if stage.name == name:
+                if stage.base_name in self._group_headers:
+                    self._group_headers[stage.base_name].update_display()
+                break
+        self.update_header()
+
+    def set_selection(self, idx: int, selected_name: str) -> None:  # pragma: no cover
+        """Update selection state and scroll to keep it visible."""
+        old_idx = self._selected_idx
+        self._selected_idx = idx
+
+        # Update old and new selected rows
+        if 0 <= old_idx < len(self._stages):
+            old_name = self._stages[old_idx].name
+            if old_name in self._rows:
+                self._rows[old_name].update_display(is_selected=False)
+        if selected_name in self._rows:
+            self._rows[selected_name].update_display(is_selected=True)
+            # Scroll to keep selected row visible
+            self._rows[selected_name].scroll_visible()
+
+    def toggle_group(self, base_name: str) -> bool:  # pragma: no cover
+        """Toggle collapse state for a group. Returns new collapsed state."""
+        if base_name not in self._group_headers:
+            return False
+
+        header = self._group_headers[base_name]
+        is_collapsed = header.toggle_collapse()
+        header.update_display()
+
+        # Update collapsed groups set
+        if is_collapsed:
+            self._collapsed_groups.add(base_name)
+        else:
+            self._collapsed_groups.discard(base_name)
+
+        # Update CSS class on all rows in this group
+        for stage in self._stages:
+            if stage.base_name == base_name and stage.name in self._rows:
+                row = self._rows[stage.name]
+                if is_collapsed:
+                    row.add_class("collapsed")
+                else:
+                    row.remove_class("collapsed")
+
+        return is_collapsed
+
+    def get_group_at_selection(self) -> str | None:  # pragma: no cover
+        """Get base_name of group header if selection is on first stage of a group."""
+        if not self._stages or self._selected_idx >= len(self._stages):
+            return None
+        stage = self._stages[self._selected_idx]
+        # Check if this is the first stage of a multi-variant group
+        groups = self._compute_groups()
+        if stage.base_name in groups and len(groups[stage.base_name]) >= 2:
+            # Check if this is the first stage of the group
+            first_in_group = groups[stage.base_name][0]
+            if stage.name == first_in_group.name:
+                return stage.base_name
+        return None
 
     def rebuild(self, stages: list[StageInfo]) -> None:  # pragma: no cover
         """Rebuild panel with new stage list."""
         self._stages = stages
         self._rows.clear()
+        self._group_headers.clear()
         self.refresh(recompose=True)
 
 
@@ -238,7 +507,7 @@ class DetailPanel(textual.widgets.Static):
             self.update("[dim]No stage selected[/]")
             return
 
-        label, style = STATUS_STYLES.get(self._stage.status, ("?", "dim"))
+        label, style = _get_status_label(self._stage.status)
         elapsed_str = _format_elapsed(self._stage.elapsed)
         if elapsed_str:
             elapsed_str = f" {elapsed_str} elapsed"
@@ -527,12 +796,12 @@ _TUI_CSS: str = """
 }
 
 #stage-list {
-    width: 35%;
-    min-width: 30;
-    max-width: 50;
+    width: 40%;
+    min-width: 35;
+    max-width: 60;
     height: 100%;
     border: solid $surface-lighten-1;
-    padding: 1;
+    padding: 0 1;
 }
 
 #stage-list.focused {
@@ -583,6 +852,16 @@ _TUI_CSS: str = """
 .section-header {
     text-style: bold;
     margin-bottom: 1;
+}
+
+/* Stage row collapsed state (inside collapsed group) */
+.stage-row.collapsed {
+    display: none;
+}
+
+/* Group header styling */
+.stage-group-header {
+    background: $surface-lighten-1;
 }
 
 #logs-view {
@@ -737,7 +1016,7 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
                 self._stages[name] = info
                 self._stage_order.append(name)
             # Select first stage by default
-            self._selected_stage_name = stage_names[0]
+            self._select_stage(0)
 
     @property
     def selected_stage_name(self) -> str | None:
@@ -753,9 +1032,8 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def select_stage_by_index(self, idx: int) -> None:
         """Select a stage by index (for testing)."""
-        if 0 <= idx < len(self._stage_order):
-            self._selected_idx = idx
-            self._update_detail_panel()
+        self._select_stage(idx)
+        self._update_detail_panel()
 
     def _close_log_file(self) -> None:
         """Close the log file if open (thread-safe)."""
@@ -780,6 +1058,15 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
             # Stage was removed, select first available
             self._selected_idx = 0
             self._selected_stage_name = self._stage_order[0] if self._stage_order else None
+
+    def _try_query_one[W: textual.widget.Widget](
+        self, selector: str, widget_type: type[W]
+    ) -> W | None:
+        """Query for a widget, returning None if not found."""
+        try:
+            return self.query_one(selector, widget_type)
+        except textual.css.query.NoMatches:
+            return None
 
     def _write_to_log(self, data: str) -> None:  # pragma: no cover
         """Write a line to the log file, logging warning on first failure."""
@@ -851,12 +1138,10 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
         log_panel.add_log(stage, line, is_stderr)
 
         # Update stage-specific log panel if this stage is selected
-        if self._selected_stage_name == stage:
-            try:
-                stage_log_panel = self.query_one("#stage-logs", StageLogPanel)
-                stage_log_panel.add_log(line, is_stderr, timestamp)
-            except textual.css.query.NoMatches:
-                _logger.debug("stage-logs panel not found during log update")
+        if self._selected_stage_name == stage and (
+            stage_log_panel := self._try_query_one("#stage-logs", StageLogPanel)
+        ):
+            stage_log_panel.add_log(line, is_stderr, timestamp)
 
     def _update_detail_panel(self) -> None:  # pragma: no cover
         stage = self._stages.get(self._selected_stage_name) if self._selected_stage_name else None
@@ -878,17 +1163,16 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def _get_active_diff_panel(self) -> InputDiffPanel | OutputDiffPanel | None:  # pragma: no cover
         """Get the diff panel for the active tab, if any."""
-        try:
-            tabs = self.query_one("#detail-tabs", textual.widgets.TabbedContent)
-            match tabs.active:
-                case "tab-input":
-                    return self.query_one("#input-panel", InputDiffPanel)
-                case "tab-output":
-                    return self.query_one("#output-panel", OutputDiffPanel)
-                case _:
-                    return None  # Logs tab has no selectable items
-        except textual.css.query.NoMatches:
+        tabs = self._try_query_one("#detail-tabs", textual.widgets.TabbedContent)
+        if tabs is None:
             return None
+        match tabs.active:
+            case "tab-input":
+                return self._try_query_one("#input-panel", InputDiffPanel)
+            case "tab-output":
+                return self._try_query_one("#output-panel", OutputDiffPanel)
+            case _:
+                return None  # Logs tab has no selectable items
 
     def action_nav_down(self) -> None:  # pragma: no cover
         """Navigate down - stage list or item list depending on focus."""
@@ -956,12 +1240,20 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
     def action_next_stage(self) -> None:  # pragma: no cover
         if self._selected_idx < len(self._stage_order) - 1:
             self._select_stage(self._selected_idx + 1)
+            self._update_stage_list_selection()
             self._update_detail_panel()
 
     def action_prev_stage(self) -> None:  # pragma: no cover
         if self._selected_idx > 0:
             self._select_stage(self._selected_idx - 1)
+            self._update_stage_list_selection()
             self._update_detail_panel()
+
+    def _update_stage_list_selection(self) -> None:  # pragma: no cover
+        """Update stage list panel to reflect current selection."""
+        if self._selected_stage_name:
+            stage_list = self.query_one("#stage-list", StageListPanel)
+            stage_list.set_selection(self._selected_idx, self._selected_stage_name)
 
     def action_toggle_view(self) -> None:  # pragma: no cover
         self._show_logs = not self._show_logs
@@ -996,10 +1288,17 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
             panel.collapse_details()
 
     def action_expand_details(self) -> None:  # pragma: no cover
-        """Expand details pane to full width."""
-        panel = self._get_active_diff_panel()
-        if self._focused_panel == "detail" and panel:
-            panel.expand_details()
+        """Expand details pane or toggle group collapse."""
+        if self._focused_panel == "stages":
+            # Toggle group collapse if on first stage of a group
+            stage_list = self.query_one("#stage-list", StageListPanel)
+            group_base = stage_list.get_group_at_selection()
+            if group_base:
+                stage_list.toggle_group(group_base)
+        elif self._focused_panel == "detail":
+            panel = self._get_active_diff_panel()
+            if panel:
+                panel.expand_details()
 
     def action_next_changed(self) -> None:  # pragma: no cover
         """Move selection to next changed item."""
@@ -1043,14 +1342,12 @@ class _BaseTuiApp(textual.app.App[_AppReturnT]):
 
     def _collect_debug_stats(self) -> DebugStats:  # pragma: no cover
         """Collect current debug statistics."""
-        active_workers = sum(
-            1 for s in self._stages.values() if s.status == StageStatus.IN_PROGRESS
-        )
+        counts = _count_statuses(self._stages.values())
 
         return DebugStats(
             tui_queue=self._tui_stats.get_stats(),
             output_queue=self._output_stats.get_stats() if self._output_stats else None,
-            active_workers=active_workers,
+            active_workers=counts["running"],
             memory_mb=get_memory_mb(),
             uptime_seconds=time.monotonic() - self._start_time,
         )
@@ -1158,7 +1455,7 @@ class RunTuiApp(_BaseTuiApp[dict[str, ExecutionSummary] | None]):
         info.elapsed = msg["elapsed"]
 
         stage_list = self.query_one("#stage-list", StageListPanel)
-        stage_list.update_stage(stage)
+        stage_list.update_stage(stage, self._selected_stage_name)
         self._update_detail_panel()
 
         completed = sum(
@@ -1414,7 +1711,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
     def __init__(
         self,
-        engine: WatchEngineProtocol,
+        engine: WatchEngine,
         message_queue: TuiQueue,
         output_queue: mp.Queue[OutputMessage] | None = None,
         tui_log: Path | None = None,
@@ -1424,7 +1721,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
         serve: bool = False,
     ) -> None:
         super().__init__(message_queue, stage_names, tui_log=tui_log)
-        self._engine: WatchEngineProtocol = engine
+        self._engine: WatchEngine = engine
         self._output_queue = output_queue
         self._engine_thread: threading.Thread | None = None
         self._no_commit: bool = no_commit
@@ -1459,9 +1756,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
     async def _start_agent_server(self) -> None:  # pragma: no cover
         """Start the JSON-RPC agent server."""
         socket_path = project.get_project_root() / ".pivot" / "agent.sock"
-        # Cast to actual WatchEngine type - we know it's the real thing at runtime
-        engine = cast("WatchEngine", self._engine)
-        self._agent_server = agent_server.AgentServer(engine, socket_path)
+        self._agent_server = agent_server.AgentServer(self._engine, socket_path)
 
         server = None
         try:
@@ -1564,7 +1859,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
             self._rebuild_stage_list()
         else:
             stage_list = self.query_one("#stage-list", StageListPanel)
-            stage_list.update_stage(stage)
+            stage_list.update_stage(stage, self._selected_stage_name)
         self._update_detail_panel()
 
     def _handle_watch(self, msg: TuiWatchMessage) -> None:  # pragma: no cover
@@ -1740,7 +2035,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
         """Get the history deque for the currently selected stage."""
         if self._selected_stage_name and self._selected_stage_name in self._stages:
             return self._stages[self._selected_stage_name].history
-        return collections.deque()
+        # Return empty deque with same maxlen as StageInfo.history for consistency
+        return collections.deque(maxlen=50)
 
     def _navigate_history_prev(self) -> bool:  # pragma: no cover
         """Navigate to previous (older) history entry. Returns True if navigation occurred."""
@@ -1781,21 +2077,16 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
     def _update_history_view(self) -> None:  # pragma: no cover
         """Update the detail panel to show the current history view."""
-        try:
-            detail = self.query_one("#detail-panel", TabbedDetailPanel)
-        except textual.css.query.NoMatches:
+        detail = self._try_query_one("#detail-panel", TabbedDetailPanel)
+        if detail is None:
             return
 
         history = self._get_current_stage_history()
         total = len(history)
 
         # Get diff panels for snapshot updates
-        try:
-            input_panel = self.query_one("#input-panel", InputDiffPanel)
-            output_panel = self.query_one("#output-panel", OutputDiffPanel)
-        except textual.css.query.NoMatches:
-            input_panel = None
-            output_panel = None
+        input_panel = self._try_query_one("#input-panel", InputDiffPanel)
+        output_panel = self._try_query_one("#output-panel", OutputDiffPanel)
 
         if self._viewing_history_index is None:
             # Live view - show current stage state
@@ -1804,11 +2095,8 @@ class WatchTuiApp(_BaseTuiApp[None]):
             )
             detail.set_history_view(None, total, None)
             # Restore live logs
-            try:
-                log_panel = self.query_one("#stage-logs", StageLogPanel)
+            if log_panel := self._try_query_one("#stage-logs", StageLogPanel):
                 log_panel.set_stage(stage)
-            except textual.css.query.NoMatches:
-                _logger.debug("Stage log panel not present, skipping live log restore")
             # Restore live diff panels
             if input_panel:
                 input_panel.set_stage(self._selected_stage_name)
@@ -2025,7 +2313,7 @@ class WatchTuiApp(_BaseTuiApp[None]):
 
 
 def run_watch_tui(
-    engine: WatchEngineProtocol,
+    engine: WatchEngine,
     message_queue: TuiQueue,
     output_queue: mp.Queue[OutputMessage] | None = None,
     tui_log: Path | None = None,

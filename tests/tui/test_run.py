@@ -470,22 +470,25 @@ def test_executor_status_includes_correct_index_and_total(
 # =============================================================================
 
 
-def test_status_styles_covers_all_statuses() -> None:
-    """STATUS_STYLES dict has entries for all relevant StageStatus values."""
-    assert StageStatus.READY in run_tui.STATUS_STYLES
-    assert StageStatus.IN_PROGRESS in run_tui.STATUS_STYLES
-    assert StageStatus.COMPLETED in run_tui.STATUS_STYLES
-    assert StageStatus.RAN in run_tui.STATUS_STYLES
-    assert StageStatus.SKIPPED in run_tui.STATUS_STYLES
-    assert StageStatus.FAILED in run_tui.STATUS_STYLES
-    assert StageStatus.UNKNOWN in run_tui.STATUS_STYLES
-
-
-def test_status_styles_returns_tuple() -> None:
-    """STATUS_STYLES values are (label, style) tuples."""
-    for status, (label, style) in run_tui.STATUS_STYLES.items():
-        assert isinstance(label, str), f"Label for {status} should be string"
+def test_status_functions_cover_all_statuses() -> None:
+    """_get_status_symbol and _get_status_label handle all StageStatus values."""
+    for status in StageStatus:
+        symbol, style = run_tui._get_status_symbol(status)
+        assert isinstance(symbol, str), f"Symbol for {status} should be string"
         assert isinstance(style, str), f"Style for {status} should be string"
+
+        label, label_style = run_tui._get_status_label(status)
+        assert isinstance(label, str), f"Label for {status} should be string"
+        assert isinstance(label_style, str), f"Label style for {status} should be string"
+
+
+def test_status_functions_return_non_empty() -> None:
+    """Status functions return non-empty values."""
+    for status in StageStatus:
+        symbol, _ = run_tui._get_status_symbol(status)
+        assert len(symbol) > 0, f"Symbol for {status} should not be empty"
+
+        label, _ = run_tui._get_status_label(status)
         assert len(label) > 0, f"Label for {status} should not be empty"
 
 
@@ -530,7 +533,11 @@ def test_watch_tui_app_init_no_commit(no_commit: bool, expected: bool) -> None:
     """WatchTuiApp initializes no_commit correctly."""
     # TUI queue uses stdlib queue.Queue (inter-thread, not cross-process)
     tui_queue: TuiQueue = thread_queue.Queue()
-    app = run_tui.WatchTuiApp(_MockEngine(), tui_queue, no_commit=no_commit)
+    app = run_tui.WatchTuiApp(
+        _MockEngine(),  # pyright: ignore[reportArgumentType] - mock for testing
+        tui_queue,
+        no_commit=no_commit,
+    )
     assert app._no_commit is expected
 
 
