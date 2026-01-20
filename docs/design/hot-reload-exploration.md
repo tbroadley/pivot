@@ -1,7 +1,9 @@
-# RFC: Hot Reload Exploration
+# Hot Reload Exploration
 
-> **GitHub Issue Title:** Explore Hot Reload for Faster Code Change Handling
-> **Labels:** `enhancement`, `research`, `future`
+!!! warning "Work in Progress"
+    This is an exploratory design document. Hot reload is not currently implemented.
+
+*This document explores the feasibility of hot reload for faster code change handling.*
 
 ## Summary
 

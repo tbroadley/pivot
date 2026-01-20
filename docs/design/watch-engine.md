@@ -1,7 +1,6 @@
-# RFC: Watch Execution Engine
+# Watch Engine Design
 
-> **GitHub Issue Title:** Watch Execution Engine
-> **Labels:** `enhancement`, `architecture`
+*This document captures the design decisions and trade-offs for the watch execution engine.*
 
 ## Summary
 

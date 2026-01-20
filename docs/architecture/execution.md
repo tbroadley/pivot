@@ -134,6 +134,106 @@ Each stage execution:
 7. **Write Lock File** - Record new fingerprint and hashes
 8. **Release Lock**
 
+## Three-Tier Skip Detection
+
+Pivot uses a three-tier skip detection system to minimize unnecessary work:
+
+```
+                Worker receives stage
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │   Hash all dep files   │
+          │   (uses StateDB cache) │
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+Tier 1:   │  Check generation O(1) │──── Match? ──▶ SKIP
+          │  (StateDB lookup)      │
+          └────────────┬───────────┘
+                       │ No match
+                       ▼
+          ┌────────────────────────┐
+Tier 2:   │  Compare lock file     │──── Unchanged? ─▶ SKIP
+          │  (fingerprint+params+  │
+          │   dep_hashes)          │
+          └────────────┬───────────┘
+                       │ Changed
+                       ▼
+          ┌────────────────────────┐
+Tier 3:   │  Check run cache       │──── Hit? ─────▶ SKIP
+          │  (input_hash → outputs)│                (restore from cache)
+          └────────────┬───────────┘
+                       │ No hit
+                       ▼
+                ┌──────────────┐
+                │   EXECUTE    │
+                │  stage func  │
+                └──────────────┘
+```
+
+### Tier 1: Generation Check (O(1))
+
+The fastest check compares recorded dependency generations against current values:
+
+- Each output file has a generation counter in StateDB
+- When a stage runs, it records the generation of each dependency
+- On next run, compare recorded generations vs current
+- If all generations match → skip without re-hashing files
+
+This avoids expensive file hashing when nothing has changed.
+
+### Tier 2: Lock File Comparison
+
+If generations don't match, perform a full comparison:
+
+- Code fingerprint (AST hash of function + dependencies)
+- Parameters (Pydantic model values)
+- Dependency hashes (content hashes of all input files)
+
+If all match the lock file → skip.
+
+### Tier 3: Run Cache Lookup
+
+If the current inputs differ from the lock file but match a previous execution:
+
+- Compute `input_hash` from fingerprint + params + dep_hashes
+- Look up in run cache: `input_hash → cached_outputs`
+- If found → restore outputs from cache, skip execution
+
+This enables skipping even when switching between branches or reverting changes.
+
+## StateDB Architecture
+
+StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefixes to namespace different data types:
+
+| Prefix | Purpose | Path Strategy |
+|--------|---------|---------------|
+| `hash:` | File hash cache | `resolve()` (physical dedup) |
+| `gen:` | Output generation counters | `normpath()` (logical paths) |
+| `dep:` | Stage dependency generations | Stage name |
+| `runcache:` | Run cache entries | Input hash |
+| `run:` | Run history manifests | Run ID |
+| `remote:` | Remote index entries | File hash |
+
+### Multi-process safety
+
+- Workers open StateDB in `readonly=True` mode (no write contention)
+- Workers collect `DeferredWrites` and return them to the coordinator
+- Coordinator applies all writes atomically in a single LMDB transaction
+
+### Generation tracking
+
+Generation counters enable the O(1) skip check:
+
+```python
+# If stage recorded deps at gen [5, 3, 7] and current gens are [5, 3, 7]:
+#   → Skip without re-hashing files
+# If any gen differs:
+#   → Fall back to full hash comparison
+```
+
 ## Concurrency Safety
 
 Pivot uses a "check-lock-recheck" pattern to prevent TOCTOU (Time-of-Check-Time-of-Use) race conditions in parallel execution.

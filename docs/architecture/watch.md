@@ -266,6 +266,23 @@ On `Ctrl+C`:
 - **No cancellation**: Long-running stages cannot be interrupted mid-execution
 - **Single machine**: Not designed for distributed execution
 - **Memory**: Long-running watch sessions should be restarted periodically
+- **Intermediate file detection gap**: See below
+
+### Intermediate File Detection Gap
+
+External changes to files that are both outputs and downstream inputs are **not detected** by watch mode.
+
+**Why this happens:** Stage outputs are filtered from the watcher to prevent infinite loops (stage runs → writes output → triggers watch → stage runs again). This filtering applies to ALL outputs, including those that are also inputs to downstream stages.
+
+**Example scenario:**
+
+```
+preprocess → data/clean.csv → train
+```
+
+If an external tool (not Pivot) modifies `data/clean.csv`, watch mode won't detect it because `data/clean.csv` is filtered as an output of `preprocess`.
+
+**Workaround:** Force a re-run with `pivot run --force` or modify an upstream input file to trigger the pipeline.
 
 ## Future Work
 
@@ -273,5 +290,6 @@ See [GitHub Issue #110: Hot Reload Exploration](https://github.com/sjawhar/pivot
 
 ## See Also
 
-- [Watch Mode](../guide/watch.md) - User guide for watch mode
+- [Watch Mode Reference](../reference/watch.md) - User guide for watch mode
+- [Watch Mode Tutorial](../tutorial/watch.md) - Getting started with watch mode
 - [Execution Model](./execution.md) - Batch execution architecture

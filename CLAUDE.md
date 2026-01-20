@@ -92,7 +92,12 @@ Stage functions, output TypedDicts, and custom loaders must be **module-level** 
   ```python
   return json.load(f)  # type: ignore[return-value] - json returns Any
   ```
-- Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
+
+**For untyped third-party packages**, prefer solutions in this order:
+1. **Check `typings/` first**—we maintain stubs for loky, pygtrie, dvc, lmdb, etc.
+2. **Add to existing stubs**—if the package has stubs but missing a function, add it
+3. **Generate new stubs**—use `scripts/generate_stubs.py` (see script docstring for workflow)
+4. **Line suppressions**—last resort, with `# pyright: ignore[errorCode]` and explanation
 
 ## Python 3.13+ Types
 
@@ -266,3 +271,4 @@ These are recurring patterns that lead to corrections:
 13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
 14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
 15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
+16. **Use `loky.cpu_count()` over `os.cpu_count()`**—loky's version respects cgroup CPU limits in containers/cgroupsv2

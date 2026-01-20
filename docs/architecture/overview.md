@@ -51,6 +51,35 @@ Constructs a directed acyclic graph from stage dependencies:
 - Validates no cycles exist
 - Enables topological ordering
 
+#### Edge Direction
+
+Edges point **consumer → producer** (the stage that USES an artifact points to the stage that PRODUCES it):
+
+```python
+# If train uses preprocess's output:
+graph.add_edge("train", "preprocess")  # train → preprocess
+
+# This means:
+graph.successors("train")   # Returns upstream producers ["preprocess"]
+graph.predecessors("train") # Returns downstream consumers
+```
+
+This convention may seem counter-intuitive, but it enables natural execution ordering: `nx.dfs_postorder_nodes()` returns dependencies before dependents without needing to reverse the graph.
+
+#### Path Resolution
+
+The DAG builder uses two strategies to match dependencies to outputs:
+
+1. **Exact match (O(1)):** Dictionary lookup via `_build_outputs_map()`
+   - Maps each output path to its producing stage
+   - Handles the common case of explicit path dependencies
+
+2. **Directory overlap (O(log n)):** pygtrie prefix tree for parent/child relationships
+   - `has_subtrie()`: Dependency is parent of outputs (`data/` depends on `data/file.csv`)
+   - `shortest_prefix()`: Dependency is child of output (`data/file.csv` depends on `data/`)
+
+This handles cases where a stage declares a directory output and another stage depends on a file within that directory (or vice versa).
+
 ### Scheduler
 
 Coordinates parallel execution:
