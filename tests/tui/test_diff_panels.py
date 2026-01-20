@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pivot import loaders, outputs, project
 from pivot.storage import cache
 from pivot.tui import diff_panels
@@ -11,8 +13,6 @@ from pivot.types import ChangeType, LockData, OutputChange
 
 if TYPE_CHECKING:
     import pathlib
-
-    import pytest
 
     from pivot.registry import RegistryStageInfo
 
@@ -149,9 +149,9 @@ def test_get_relative_path_relative(
 
 
 def test_get_registry_info_missing_stage() -> None:
-    """_get_registry_info returns None for missing stage."""
-    result = diff_panels._get_registry_info("nonexistent_stage_xyz")
-    assert result is None
+    """_get_registry_info raises KeyError for missing stage."""
+    with pytest.raises(KeyError):
+        diff_panels._get_registry_info("nonexistent_stage_xyz")
 
 
 # =============================================================================
