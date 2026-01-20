@@ -36,6 +36,7 @@ from pivot.types import (
     OutputChange,
     ParamChange,
     StageExplanation,
+    StageStatus,
 )
 
 if TYPE_CHECKING:
@@ -707,6 +708,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
     # Cache for stage data
     _stage_name: str | None
     _registry_info: RegistryStageInfo | None
+    _stage_status: StageStatus | None
     # Dict-based storage for O(1) lookup by path
     _output_by_path: dict[str, OutputChange]
     _metric_diff_cache: dict[str, list[MetricDiff]]
@@ -717,15 +719,19 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             id=id, classes="diff-panel" if classes is None else f"diff-panel {classes}"
         )
         self._registry_info = None
+        self._stage_status = None
         self._output_by_path = dict[str, OutputChange]()
         self._metric_diff_cache = dict[str, list[MetricDiff]]()
         self._head_hashes = None
 
     @override
-    def set_stage(self, stage_name: str | None) -> None:  # pragma: no cover
+    def set_stage(  # pragma: no cover
+        self, stage_name: str | None, *, status: StageStatus | None = None
+    ) -> None:
         """Update the displayed stage and load data."""
         self._reset_selection_state()
         self._registry_info = None
+        self._stage_status = status
         self._output_by_path.clear()
         self._metric_diff_cache.clear()
         self._head_hashes = None
@@ -1095,12 +1101,18 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             return "[dim]No stage selected[/]"
         if self._registry_info is None:
             return "[dim]Stage not in registry[/]"
+        # Show "running" message only if stage is actually in progress
+        if self._stage_status == StageStatus.IN_PROGRESS:
+            return "[dim]Stage running - output will appear when complete[/]"
         return "[dim]No outputs[/]"
 
-    def set_from_snapshot(self, stage_name: str, changes: list[OutputChange]) -> None:
+    def set_from_snapshot(
+        self, stage_name: str, changes: list[OutputChange], *, status: StageStatus | None = None
+    ) -> None:
         """Display pre-captured snapshot instead of computing from current state."""
         self._reset_selection_state()
         self._stage_name = stage_name
+        self._stage_status = status
         self._registry_info = _get_registry_info(stage_name)
         self._output_by_path = {c["path"]: c for c in changes}
         self._metric_diff_cache.clear()  # Metric diffs not available for historical

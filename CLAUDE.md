@@ -266,3 +266,4 @@ These are recurring patterns that lead to corrections:
 13. **ruamel.yaml for editable config** (preserves comments), **PyYAML for read-only**
 14. **Stage functions and TypedDicts must be module-level**—`get_type_hints()` needs importable `__module__`
 15. **Lambda fingerprinting is non-deterministic**—lambdas without source fall back to `id(func)`, causing unnecessary re-runs across interpreter sessions. Always use named functions in stage definitions.
+16. **Use `loky.cpu_count()` over `os.cpu_count()`**—loky's version respects cgroup CPU limits in containers/cgroupsv2

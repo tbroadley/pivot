@@ -134,6 +134,9 @@ class StageInfo:
     history: collections.deque[ExecutionHistoryEntry] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=50)
     )
+    # Live snapshots for display during execution (before lock files are updated)
+    live_input_snapshot: StageExplanation | None = None
+    live_output_snapshot: list[OutputChange] | None = None
 
 
 class TuiUpdate(textual.message.Message):
@@ -364,16 +367,28 @@ class TabbedDetailPanel(textual.containers.Vertical):
         except textual.css.query.NoMatches:
             _logger.debug("stage-logs not found during set_stage")
 
-        # Update diff panels (share same interface - take stage name string)
-        diff_panels: list[tuple[str, type[InputDiffPanel] | type[OutputDiffPanel]]] = [
-            ("#input-panel", InputDiffPanel),
-            ("#output-panel", OutputDiffPanel),
-        ]
-        for panel_id, panel_cls in diff_panels:
-            try:
-                self.query_one(panel_id, panel_cls).set_stage(stage_name)
-            except textual.css.query.NoMatches:
-                _logger.debug(f"{panel_id} not found during set_stage")
+        # Update Input panel - use live snapshot if available
+        try:
+            input_panel = self.query_one("#input-panel", InputDiffPanel)
+            if stage and stage.live_input_snapshot:
+                input_panel.set_from_snapshot(stage.live_input_snapshot)
+            else:
+                input_panel.set_stage(stage_name)
+        except textual.css.query.NoMatches:
+            _logger.debug("input-panel not found during set_stage")
+
+        # Update Output panel - use live snapshot if available, pass status for empty state
+        try:
+            output_panel = self.query_one("#output-panel", OutputDiffPanel)
+            status = stage.status if stage else None
+            if stage and stage.live_output_snapshot:
+                output_panel.set_from_snapshot(
+                    stage.name, stage.live_output_snapshot, status=status
+                )
+            else:
+                output_panel.set_stage(stage_name, status=status)
+        except textual.css.query.NoMatches:
+            _logger.debug("output-panel not found during set_stage")
 
     def set_history_view(
         self, index: int | None, total: int, entry: ExecutionHistoryEntry | None
@@ -1534,7 +1549,13 @@ class WatchTuiApp(_BaseTuiApp[None]):
                     self._current_run_id,
                 )
                 self._pending_history.clear()
+            # Clear live snapshots from previous run and refresh display
+            for stage_info in self._stages.values():
+                stage_info.live_input_snapshot = None
+                stage_info.live_output_snapshot = None
             self._current_run_id = run_id
+            # Always refresh panel when snapshots are cleared to avoid stale display
+            self._update_detail_panel()
 
         if is_new_stage:
             info = StageInfo(stage, msg["index"], msg["total"])
@@ -1565,7 +1586,10 @@ class WatchTuiApp(_BaseTuiApp[None]):
         else:
             stage_list = self.query_one("#stage-list", StageListPanel)
             stage_list.update_stage(stage)
-        self._update_detail_panel()
+
+        # Only refresh detail panel if the updated stage is the one being viewed
+        if stage == self._selected_stage_name:
+            self._update_detail_panel()
 
     def _handle_watch(self, msg: TuiWatchMessage) -> None:  # pragma: no cover
         """Handle reactive status updates - update title bar."""
@@ -1649,6 +1673,10 @@ class WatchTuiApp(_BaseTuiApp[None]):
             input_snapshot=input_snapshot,
         )
 
+        # Store live input snapshot for display during execution (only if in live view)
+        if self._viewing_history_index is None and stage_name in self._stages:
+            self._stages[stage_name].live_input_snapshot = input_snapshot
+
     def _finalize_history_entry(
         self,
         stage_name: str,
@@ -1698,6 +1726,10 @@ class WatchTuiApp(_BaseTuiApp[None]):
                 output_snapshot = diff_panels.compute_output_changes(lock_data, registry_info)
             except Exception:
                 _logger.debug("Failed to capture output snapshot for %s", stage_name)
+
+            # Store live output snapshot for display (only if in live view)
+            if self._viewing_history_index is None:
+                info.live_output_snapshot = output_snapshot
 
             entry = ExecutionHistoryEntry(
                 run_id=pending.run_id,
@@ -1813,7 +1845,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
             if input_panel:
                 input_panel.set_stage(self._selected_stage_name)
             if output_panel:
-                output_panel.set_stage(self._selected_stage_name)
+                output_panel.set_stage(
+                    self._selected_stage_name, status=stage.status if stage else None
+                )
         else:
             # Historical view
             if 0 <= self._viewing_history_index < total:
@@ -1827,7 +1861,9 @@ class WatchTuiApp(_BaseTuiApp[None]):
                         input_panel.set_stage(None)  # Show "no data" state
                 if output_panel:
                     if entry.output_snapshot:
-                        output_panel.set_from_snapshot(entry.stage_name, entry.output_snapshot)
+                        output_panel.set_from_snapshot(
+                            entry.stage_name, entry.output_snapshot, status=entry.status
+                        )
                     else:
                         output_panel.set_stage(None)  # Show "no data" state
 
