@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import os
 import pathlib
 import queue
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
@@ -37,13 +38,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _working_directory(cwd: pathlib.Path | None) -> contextlib.AbstractContextManager[None]:
-    """Return context manager to temporarily change working directory."""
-    if cwd is None:
-        return contextlib.nullcontext()
-    return contextlib.chdir(cwd)
-
-
 class WorkerStageInfo(TypedDict):
     """Stage info subset passed to worker processes."""
 
@@ -55,14 +49,14 @@ class WorkerStageInfo(TypedDict):
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
-    cwd: pathlib.Path | None
     checkout_modes: list[str]
     run_id: str
     force: bool
     no_commit: bool
     no_cache: bool
     dep_specs: dict[str, stage_def.FuncDepSpec]
-    out_path_overrides: dict[str, outputs.PathType] | None
+    out_specs: dict[str, outputs.Out[Any]]
+    params_arg_name: str | None
 
 
 def _make_result(
@@ -192,17 +186,17 @@ def execute_stage(
 
             _prepare_outputs_for_execution(stage_outs, lock_data, files_cache_dir)
 
-            with _working_directory(stage_info["cwd"]):
-                _run_stage_function_with_injection(
-                    stage_info["func"],
-                    stage_name,
-                    output_queue,
-                    output_lines,
-                    params_instance,
-                    stage_info["dep_specs"],
-                    project_root,
-                    stage_info["out_path_overrides"],
-                )
+            _run_stage_function_with_injection(
+                stage_info["func"],
+                stage_name,
+                output_queue,
+                output_lines,
+                params_instance,
+                stage_info["dep_specs"],
+                project_root,
+                stage_info["out_specs"],
+                stage_info["params_arg_name"],
+            )
 
             # Compute output hashes (null for no_cache, actual otherwise)
             if no_cache:
@@ -253,6 +247,11 @@ def execute_stage(
         return _make_result(StageStatus.FAILED, str(e), output_lines)
 
 
+def _get_normalized_out_paths(stage_info: WorkerStageInfo) -> list[str]:
+    """Get normalized output paths from stage info, matching lock_data format."""
+    return [str(project.normalize_path(str(out.path))) for out in stage_info["outs"]]
+
+
 def _check_skip_or_run(
     stage_name: str,
     stage_info: WorkerStageInfo,
@@ -270,8 +269,7 @@ def _check_skip_or_run(
     - If skip_reason is None: stage must run, run_reason explains why
     - input_hash is always returned for run cache recording
     """
-    # Registry always stores single-file outputs (multi-file are expanded)
-    out_paths = [str(out.path) for out in stage_info["outs"]]
+    out_paths = _get_normalized_out_paths(stage_info)
     deps_list = [DepEntry(path=path, hash=info["hash"]) for path, info in dep_hashes.items()]
     input_hash = run_history.compute_input_hash(
         current_fingerprint, current_params, deps_list, out_paths
@@ -284,7 +282,7 @@ def _check_skip_or_run(
         return "unchanged (generation)", "", input_hash
 
     changed, run_reason = stage_lock.is_changed_with_lock_data(
-        lock_data, current_fingerprint, current_params, dep_hashes
+        lock_data, current_fingerprint, current_params, dep_hashes, out_paths
     )
     if not changed:
         return "unchanged", "", input_hash
@@ -413,7 +411,8 @@ def _run_stage_function_with_injection(
     params: stage_def.StageParams | None = None,
     dep_specs: dict[str, stage_def.FuncDepSpec] | None = None,
     project_root: pathlib.Path | None = None,
-    return_out_path_overrides: dict[str, outputs.PathType] | None = None,
+    out_specs: dict[str, outputs.Out[Any]] | None = None,
+    params_arg_name: str | None = None,
 ) -> None:
     """Run stage function with dependency injection and output capture.
 
@@ -429,7 +428,12 @@ def _run_stage_function_with_injection(
     1. Loads deps from disk based on dep_specs
     2. Builds kwargs dict (params + loaded deps)
     3. Calls the function with kwargs
-    4. Saves outputs based on return type annotations
+    4. Saves outputs based on out_specs (resolved at registration time)
+
+    Args:
+        out_specs: Output specs resolved at registration time (return key -> Out).
+            For single-output stages, uses "_single" key convention.
+        params_arg_name: Name of the StageParams parameter (pre-computed at registration).
     """
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, output_lines=output_lines),
@@ -437,11 +441,13 @@ def _run_stage_function_with_injection(
     ):
         kwargs = dict[str, Any]()
 
-        # Add params if provided (find the param arg name from signature)
+        # Add params if provided (using pre-computed arg name from registration)
         if params is not None:
-            params_arg_name, _ = stage_def.find_params_in_signature(func)
-            if params_arg_name is not None:
-                kwargs[params_arg_name] = params
+            if params_arg_name is None:
+                raise RuntimeError(
+                    f"Stage '{stage_name}' has params but params_arg_name is None - this indicates a bug in registration"
+                )
+            kwargs[params_arg_name] = params
 
         # Load and inject deps
         root = project_root if project_root is not None else project.get_project_root()
@@ -452,23 +458,16 @@ def _run_stage_function_with_injection(
         # Execute function
         result = func(**kwargs)
 
-        # Save outputs based on return type
-        return_out_specs = stage_def.get_output_specs_from_return(func)
-        single_out_spec = stage_def.get_single_output_spec_from_return(func)
-
-        if return_out_specs and result is not None:
-            # TypedDict return with multiple outputs
-            stage_def.save_return_outputs(result, return_out_specs, root, return_out_path_overrides)
-        elif single_out_spec is not None and result is not None:
-            # Single annotated return type
-            stage_def.save_return_outputs(
-                {"_single": result},
-                {"_single": single_out_spec},
-                root,
-                return_out_path_overrides,
-            )
+        # Save outputs using pre-resolved specs from registration
+        if out_specs:
+            if result is None:
+                raise RuntimeError(f"Stage '{stage_name}' has output annotations but returned None")
+            # For single-output stages, out_specs uses SINGLE_OUTPUT_KEY convention
+            if stage_def.SINGLE_OUTPUT_KEY in out_specs:
+                result = {stage_def.SINGLE_OUTPUT_KEY: result}
+            stage_def.save_return_outputs(result, out_specs, root)
         elif result is not None:
-            logger.debug(
+            logger.warning(
                 "Stage '%s' returned value but has no Out annotation - discarding", stage_name
             )
 
@@ -595,6 +594,12 @@ def _can_skip_via_generation(
     if lock_data["params"] != current_params:
         return False
 
+    # Check output paths match (normalize to match lock_data format, consistent with deps)
+    out_paths = sorted(_get_normalized_out_paths(stage_info))
+    locked_out_paths = sorted(lock_data["output_hashes"].keys())
+    if out_paths != locked_out_paths:
+        return False
+
     recorded_gens = state_db.get_dep_generations(stage_name)
     if recorded_gens is None:
         return False
@@ -602,13 +607,31 @@ def _can_skip_via_generation(
     dep_paths = [pathlib.Path(d) for d in stage_info["deps"]]
     current_gens = state_db.get_many_generations(dep_paths)
 
+    # Gather file stats for metadata verification (catches external modifications)
+    dep_stats = list[tuple[pathlib.Path, os.stat_result]]()
+    for dep in stage_info["deps"]:
+        path = pathlib.Path(dep)
+        try:
+            dep_stats.append((path, path.stat()))
+        except OSError:
+            return False
+
+    # Batch check: verify metadata matches cached values
+    cached_hashes = state_db.get_many(dep_stats)
+
     for dep in stage_info["deps"]:
         path = pathlib.Path(dep)
         normalized = str(project.normalize_path(dep))
+
+        # Check generation
         current_gen = current_gens.get(path)
         if current_gen is None:
             return False
         if current_gen != recorded_gens.get(normalized):
+            return False
+
+        # Check metadata - if None, file was externally modified or not cached
+        if cached_hashes.get(path) is None:
             return False
 
     return True
