@@ -66,17 +66,6 @@ def test_normalize_out_passthrough() -> None:
     assert outputs.normalize_out(plot) is plot
 
 
-def test_out_persist_option() -> None:
-    """All output types should support persist option."""
-    out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), persist=True)
-    metric = outputs.Metric(path="metrics.json", persist=True)
-    plot = outputs.Plot(path="loss.csv", persist=True)
-
-    assert out.persist is True
-    assert metric.persist is True
-    assert plot.persist is True
-
-
 def test_out_with_explicit_cache_false() -> None:
     """Out can explicitly set cache=False."""
     out = outputs.Out(path="file.txt", loader=loaders.PathOnly(), cache=False)
@@ -122,12 +111,6 @@ def test_incremental_out_cache_default_true() -> None:
     """IncrementalOut should have cache=True by default."""
     inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
     assert inc.cache is True
-
-
-def test_incremental_out_persist_default_false() -> None:
-    """IncrementalOut should have persist=False by default."""
-    inc = outputs.IncrementalOut(path="database.csv", loader=loaders.PathOnly())
-    assert inc.persist is False
 
 
 def test_incremental_out_frozen() -> None:

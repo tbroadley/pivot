@@ -94,7 +94,6 @@ class Out(Generic[T]):  # noqa: UP046 - basedpyright doesn't support PEP 695 syn
     path: PathType
     loader: loaders_module.Loader[T]
     cache: bool = True
-    persist: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

@@ -176,13 +176,6 @@ def test_build_out_entry_plot_with_options() -> None:
     assert result == {"loss.csv": {"x": "epoch", "y": "loss", "template": "linear"}}
 
 
-def test_build_out_entry_persist_option() -> None:
-    """Persist option should be included when True."""
-    out = outputs.Out(path="model.pkl", loader=loaders.PathOnly(), persist=True)
-    result = dvc_compat._build_out_entry(out, "model.pkl")
-    assert result == {"model.pkl": {"persist": True}}
-
-
 # === export_dvc_yaml Tests ===
 
 
@@ -237,9 +230,9 @@ def test_export_with_rich_outputs(tmp_path: pathlib.Path, monkeypatch: pytest.Mo
         variant=None,
         signature=inspect.signature(exportable_stage),
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")
@@ -335,9 +328,9 @@ def test_export_out_cache_false(tmp_path: pathlib.Path, monkeypatch: pytest.Monk
         variant=None,
         signature=inspect.signature(exportable_stage),
         fingerprint={},
-        cwd=None,
         dep_specs={},
-        out_path_overrides=None,
+        out_specs={},
+        params_arg_name=None,
     )
 
     result = dvc_compat.export_dvc_yaml(tmp_path / "dvc.yaml")

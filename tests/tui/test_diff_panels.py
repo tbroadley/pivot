@@ -176,9 +176,9 @@ def test_compute_output_changes_no_lock_shows_added(tmp_path: pathlib.Path) -> N
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)
@@ -207,9 +207,9 @@ def test_compute_output_changes_missing_file_shows_removed(tmp_path: pathlib.Pat
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     lock_data: LockData = {
@@ -247,9 +247,9 @@ def test_compute_output_changes_unchanged(tmp_path: pathlib.Path) -> None:
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     lock_data: LockData = {
@@ -291,9 +291,9 @@ def test_compute_output_changes_detects_output_types(tmp_path: pathlib.Path) -> 
         "variant": None,
         "signature": None,
         "fingerprint": {},
-        "cwd": None,
         "dep_specs": {},
-        "out_path_overrides": None,
+        "out_specs": {},
+        "params_arg_name": None,
     }
 
     result = diff_panels.compute_output_changes(None, registry_info)

@@ -1155,6 +1155,9 @@ def test_custom_loader_fingerprint():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     loader = CustomTextLoader(prefix="TEST:")
     fp = fingerprint.get_loader_fingerprint(loader)
 
@@ -1178,6 +1181,9 @@ def test_custom_loader_code_change_detected():
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
 
+        def empty(self) -> str:
+            return ""
+
     @dataclasses.dataclass(frozen=True)
     class LoaderV2(loaders.Loader[str]):
         def load(self, path: pathlib.Path) -> str:
@@ -1185,6 +1191,9 @@ def test_custom_loader_code_change_detected():
 
         def save(self, data: str, path: pathlib.Path) -> None:
             path.write_text(data)
+
+        def empty(self) -> str:
+            return ""
 
     fp1 = fingerprint.get_loader_fingerprint(LoaderV1())
     fp2 = fingerprint.get_loader_fingerprint(LoaderV2())
