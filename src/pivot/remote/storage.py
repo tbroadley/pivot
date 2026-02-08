@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -167,7 +168,8 @@ async def _stream_download_to_fd(
     fd: int,
 ) -> None:
     """Stream S3 response body to file descriptor in chunks with timeout."""
-    async with response["Body"] as stream:
+    stream = response["Body"]
+    try:
         while True:
             chunk: bytes = await asyncio.wait_for(
                 stream.read(STREAM_CHUNK_SIZE),
@@ -176,6 +178,9 @@ async def _stream_download_to_fd(
             if not chunk:
                 break
             await _write_all_async(fd, chunk)
+    finally:
+        with contextlib.suppress(Exception):
+            stream.close()  # pyright: ignore[reportUnknownMemberType]
 
 
 async def _atomic_download(

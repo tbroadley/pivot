@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import logging
 import pathlib
 from typing import TYPE_CHECKING, Literal
 
@@ -17,8 +16,6 @@ from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-logger = logging.getLogger(__name__)
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
@@ -339,7 +336,8 @@ def checkout(
     tracked_files = track.discover_pvt_files(project_root)
 
     # Get stage output info from lock files (cached outputs only)
-    stage_outputs = _get_stage_output_info()
+    pipeline = cli_decorators.get_pipeline_from_context()
+    stage_outputs = {} if pipeline is None else _get_stage_output_info()
 
     # Run async checkout
     failures, restored, skipped = asyncio.run(

@@ -164,6 +164,10 @@ markers = [
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+  "error:coroutine .* was never awaited:RuntimeWarning",
+  "error:Enable tracemalloc:RuntimeWarning",
+]
 
 [tool.ruff]
 line-length = 100
