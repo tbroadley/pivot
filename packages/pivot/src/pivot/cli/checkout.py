@@ -60,12 +60,25 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     return result
 
 
+def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
+    if is_dir_hash(expected_hash):
+        if not path.is_dir():
+            return False
+        actual_hash, _ = cache.hash_directory(path)
+    else:
+        if not path.is_file():
+            return False
+        actual_hash, _ = cache.hash_file(path)
+    return actual_hash == expected_hash["hash"]
+
+
 def _restore_path_sync(
     path: pathlib.Path,
     output_hash: HashInfo,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
+    state_dir: pathlib.Path | None = None,
 ) -> tuple[RestoreResult, str]:
     """Restore a file or directory from cache (sync version).
 
@@ -80,8 +93,10 @@ def _restore_path_sync(
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
+                if _on_disk_matches_expected(path, output_hash):
+                    return ("skipped", path.name)
                 raise click.ClickException(
-                    f"'{path.name}' already exists. "
+                    f"'{path.name}' already exists with different content. "
                     + "Use --force to overwrite or --only-missing to skip existing files."
                 )
             case CheckoutBehavior.SKIP_EXISTING:
@@ -96,7 +111,13 @@ def _restore_path_sync(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
-    success = cache.restore_from_cache(path, output_hash, cache_dir, checkout_modes=checkout_modes)
+    success = cache.restore_from_cache(
+        path,
+        output_hash,
+        cache_dir,
+        checkout_modes=checkout_modes,
+        state_dir=state_dir,
+    )
     if not success:
         return ("missing", path.name)
 
@@ -109,6 +130,7 @@ async def _checkout_files_async(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> tuple[list[str], int, int]:
     """Restore files in parallel.
 
@@ -131,7 +153,13 @@ async def _checkout_files_async(
         try:
             async with semaphore:
                 result, name = await asyncio.to_thread(
-                    _restore_path_sync, path, output_hash, cache_dir, checkout_modes, behavior
+                    _restore_path_sync,
+                    path,
+                    output_hash,
+                    cache_dir,
+                    checkout_modes,
+                    behavior,
+                    state_dir,
                 )
             match result:
                 case "missing":
@@ -233,6 +261,7 @@ async def _checkout_main_async(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> tuple[list[str], int, int]:
     """Main async checkout logic.
 
@@ -242,7 +271,14 @@ async def _checkout_main_async(
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
-        return await _checkout_files_async(files, cache_dir, checkout_modes, behavior, callback)
+        return await _checkout_files_async(
+            files,
+            cache_dir,
+            checkout_modes,
+            behavior,
+            callback,
+            state_dir=state_dir,
+        )
     else:
         # Checkout all tracked files and stage outputs
         tracked_as_hashes: dict[str, HashInfo] = {
@@ -261,11 +297,23 @@ async def _checkout_main_async(
         # Run both in parallel with shared progress counter
         t1 = asyncio.create_task(
             _checkout_files_async(
-                tracked_as_hashes, cache_dir, checkout_modes, behavior, progress_cb
+                tracked_as_hashes,
+                cache_dir,
+                checkout_modes,
+                behavior,
+                progress_cb,
+                state_dir=state_dir,
             )
         )
         t2 = asyncio.create_task(
-            _checkout_files_async(stage_outputs, cache_dir, checkout_modes, behavior, progress_cb)
+            _checkout_files_async(
+                stage_outputs,
+                cache_dir,
+                checkout_modes,
+                behavior,
+                progress_cb,
+                state_dir=state_dir,
+            )
         )
         (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)
         return (f1 + f2, r1 + r2, s1 + s2)
@@ -298,7 +346,7 @@ def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool
     return True
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
 @click.option(
     "--checkout-mode",
@@ -354,6 +402,8 @@ def checkout(
     pipeline = cli_decorators.get_pipeline_from_context()
     stage_outputs = {} if pipeline is None else _get_stage_output_info()
 
+    state_dir = config.get_state_dir()
+
     # Run async checkout
     with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
         failures, restored, skipped = asyncio.run(
@@ -365,6 +415,7 @@ def checkout(
                 checkout_modes,
                 behavior,
                 callback=progress.callback,
+                state_dir=state_dir,
             )
         )
 
