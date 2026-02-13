@@ -8,7 +8,7 @@
 ## Installing from PyPI
 
 ```bash
-pip install pivot
+uv add pivot
 ```
 
 ## Installing with Optional Dependencies
@@ -18,7 +18,7 @@ pip install pivot
 For pushing/pulling cached outputs to S3:
 
 ```bash
-pip install pivot[s3]
+uv add "pivot[s3]"
 ```
 
 ### DVC Integration
@@ -26,13 +26,13 @@ pip install pivot[s3]
 For `pivot export` to generate DVC-compatible YAML:
 
 ```bash
-pip install pivot[dvc]
+uv add "pivot[dvc]"
 ```
 
 ### All Optional Dependencies
 
 ```bash
-pip install pivot[s3,dvc]
+uv add "pivot[s3,dvc]"
 ```
 
 ## Development Installation
@@ -48,7 +48,7 @@ cd pivot
 uv sync --active
 
 # Or with pip
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
 
 ## Verifying Installation
@@ -61,4 +61,4 @@ pivot --help
 ## Next Steps
 
 - [Quick Start Tutorial](quickstart.md) - Build your first pipeline
-- [Tutorials](../tutorial/watch.md) - Watch mode, parameters, CI integration
+- [Guides](../guides/watch-mode.md) - Watch mode, multi-pipeline projects, remote storage, CI

@@ -14,44 +14,44 @@ pivot repro      # Pivot detects the change and re-runs affected stages
 
 ```python
 # pipeline.py
+import json
 import pathlib
 from typing import Annotated, TypedDict
 
-import pandas
-from pivot import loaders, outputs
-from pivot.pipeline import Pipeline
+import pivot
 
 
 class PreprocessOutputs(TypedDict):
-    clean: Annotated[pathlib.Path, outputs.Out("processed.parquet", loaders.PathOnly())]
+    clean: Annotated[pathlib.Path, pivot.Out("clean.json", pivot.loaders.PathOnly())]
 
 
 def preprocess(
-    raw: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
 ) -> PreprocessOutputs:
-    df = raw.dropna()
-    out_path = pathlib.Path("processed.parquet")
-    df.to_parquet(out_path)
+    clean = [row for row in raw["records"] if all(row.values())]
+    out_path = pathlib.Path("clean.json")
+    out_path.write_text(json.dumps({"records": clean}, indent=2))
     return PreprocessOutputs(clean=out_path)
 
 
-class TrainOutputs(TypedDict):
-    model: Annotated[pathlib.Path, outputs.Out("model.pkl", loaders.PathOnly())]
+class SummarizeOutputs(TypedDict):
+    summary: Annotated[pathlib.Path, pivot.Out("summary.json", pivot.loaders.PathOnly())]
 
 
-def train(
-    data: Annotated[pathlib.Path, outputs.Dep("processed.parquet", loaders.PathOnly())],
-) -> TrainOutputs:
-    df = pandas.read_parquet(data)
-    model_path = pathlib.Path("model.pkl")
-    # ... train model ...
-    return TrainOutputs(model=model_path)
+def summarize(
+    data: Annotated[dict, pivot.Dep("clean.json", pivot.loaders.JSON())],
+) -> SummarizeOutputs:
+    records = data["records"]
+    values = [r["value"] for r in records]
+    summary = {"count": len(values), "mean": sum(values) / len(values)}
+    out_path = pathlib.Path("summary.json")
+    out_path.write_text(json.dumps(summary, indent=2))
+    return SummarizeOutputs(summary=out_path)
 
 
-# Register stages - Pivot discovers deps/outs from annotations
-pipeline = Pipeline("my_pipeline")
+pipeline = pivot.Pipeline("my_pipeline")
 pipeline.register(preprocess)
-pipeline.register(train)
+pipeline.register(summarize)
 ```
 
 ```bash
@@ -68,16 +68,17 @@ Modify `preprocess`, and Pivot automatically re-runs both stages. Modify `train`
 Change a helper function, and Pivot knows to re-run stages that call it:
 
 ```python
-def normalize(x):
-    return x / x.max()  # Change this...
+def normalize(records):
+    max_val = max(r["value"] for r in records)
+    return [{"name": r["name"], "value": r["value"] / max_val} for r in records]
 
 def process(
-    data: Annotated[pandas.DataFrame, outputs.Dep("data.csv", loaders.CSV())],
+    raw: Annotated[dict, pivot.Dep("data.json", pivot.loaders.JSON())],
 ) -> ProcessOutputs:
-    return {"result": normalize(data)}  # ...and Pivot re-runs process
+    return ProcessOutputs(result=normalize(raw["records"]))  # ...and Pivot re-runs process
 ```
 
-No YAML to update (for code changes). No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
+No YAML to update. No manual declarations. Pivot parses your Python and tracks what each stage actually calls.
 
 ### See Why Stages Run
 
@@ -106,7 +107,7 @@ pivot repro --watch  # Re-runs automatically on file changes
 ## Getting Started
 
 ```bash
-pip install pivot
+uv add pivot
 ```
 
 See the [Quick Start](getting-started/quickstart.md) to build your first pipeline.
@@ -116,20 +117,18 @@ See the [Quick Start](getting-started/quickstart.md) to build your first pipelin
 - Python 3.13+
 - Unix only (Linux/macOS)
 
-!!! note "Loaders and Protocols"
-    `Dep()` accepts any `Reader[R]` and `Out()` accepts any `Writer[W]`. Built-in loaders like `CSV()` and `PathOnly()` implement both protocols.
-
 ## Learn More
 
-- [Tutorials](tutorial/watch.md) - Watch mode, parameters, CI integration
-- [Multi-Pipeline Projects](tutorial/multi-pipeline.md) - Organize larger codebases with automatic cross-pipeline discovery
-- [Reference](reference/pipelines.md) - Complete documentation by task
-- [Migrating from DVC](migrating-from-dvc.md) - Step-by-step migration guide
-- [Architecture](architecture/overview.md) - Design decisions and internals
-- [Comparison](comparison.md) - How Pivot compares to DVC, Prefect, Dagster
+**Start here:** Follow the [Concepts](concepts/index.md) guide — a linear learning path from
+first principles to advanced caching.
 
-## Roadmap
+Then explore task-oriented [Guides](guides/watch-mode.md) for specific workflows:
+- [Watch Mode](guides/watch-mode.md) — Rapid iteration
+- [Multi-Pipeline Projects](guides/multi-pipeline.md) — Large project organization
+- [Remote Storage](guides/remote-storage.md) — Share cache across machines
+- [CI Integration](guides/ci-integration.md) — Pipeline verification in CI
 
-- **Web UI** - DAG visualization and execution monitoring
-- **Additional remotes** - GCS, Azure, SSH
-- **Cloud orchestration** - Integration with cloud schedulers
+**Reference:**
+- [CLI Reference](cli/index.md) — All commands and options
+- [Architecture](architecture/overview.md) — For contributors
+- [Comparison with DVC](comparison.md) — Feature comparison
