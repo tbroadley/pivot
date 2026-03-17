@@ -31,8 +31,7 @@ def project_with_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
     project._project_root_cache = None
 
     # Write some test runs
-    state_db_path = project_dir / ".pivot" / "state.db"
-    with state.StateDB(state_db_path) as db:
+    with state.StateDB(project_dir / ".pivot") as db:
         for i in range(3):
             manifest = run_history.RunManifest(
                 run_id=f"2025011{i}_143000_abc1234{i}",

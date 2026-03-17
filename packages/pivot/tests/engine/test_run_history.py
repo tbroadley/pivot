@@ -47,7 +47,7 @@ async def test_engine_writes_run_history(
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
+    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # Run the stage
     collector = sinks.ResultCollectorSink()
@@ -66,7 +66,7 @@ async def test_engine_writes_run_history(
     assert registered_stage in results
 
     # Verify run history was written
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         runs = state_db.list_runs(limit=1)
 
     assert len(runs) >= 1
@@ -89,7 +89,7 @@ async def test_engine_run_history_contains_stage_records(
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
+    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # Run the stage
     collector = sinks.ResultCollectorSink()
@@ -105,7 +105,7 @@ async def test_engine_run_history_contains_stage_records(
     await test_engine.run(exit_on_completion=True)
 
     # Verify run history contains stage record
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         runs = state_db.list_runs(limit=1)
 
     assert len(runs) >= 1
@@ -133,7 +133,7 @@ async def test_engine_writes_run_cache_entry(
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_db_path", lambda: state_dir / "state.db")
+    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # First run - executes the stage
     async with Engine(pipeline=test_pipeline) as engine1:

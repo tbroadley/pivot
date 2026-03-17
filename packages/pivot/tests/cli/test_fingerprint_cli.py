@@ -19,7 +19,7 @@ def test_fingerprint_reset_clears_statedb_entries(
         # Create .pivot in isolated dir
         pivot_dir = pathlib.Path(isolated_dir) / ".pivot"
         pivot_dir.mkdir()
-        db_path = pivot_dir / "state.db"
+        db_path = pivot_dir
 
         # Add entries to this new db
         with state.StateDB(db_path, readonly=False) as db:
@@ -52,7 +52,7 @@ def test_fingerprint_reset_reports_zero_when_empty(
         # Create .pivot but don't add any entries
         pivot_dir = pathlib.Path(".pivot")
         pivot_dir.mkdir()
-        db_path = pivot_dir / "state.db"
+        db_path = pivot_dir
 
         # Initialize empty StateDB
         with state.StateDB(db_path, readonly=False):

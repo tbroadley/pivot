@@ -135,29 +135,27 @@ def get_stage_explanation(
 
     # Check generation tracking first (O(1) skip detection)
     # Use verify_files=False since status predicts run behavior after restoration
-    state_db_path = state_dir / "state.db"
-    if state_db_path.exists():
-        with state.StateDB(state_db_path, readonly=True) as state_db:
-            if not force and worker.can_skip_via_generation(
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        if not force and worker.can_skip_via_generation(
+            stage_name=stage_name,
+            fingerprint=fingerprint,
+            deps=deps,
+            outs_paths=outs_paths,
+            current_params=current_params,
+            lock_data=lock_data,
+            state_db=state_db,
+            verify_files=False,
+        ):
+            return StageExplanation(
                 stage_name=stage_name,
-                fingerprint=fingerprint,
-                deps=deps,
-                outs_paths=outs_paths,
-                current_params=current_params,
-                lock_data=lock_data,
-                state_db=state_db,
-                verify_files=False,
-            ):
-                return StageExplanation(
-                    stage_name=stage_name,
-                    will_run=False,
-                    is_forced=False,
-                    reason="",
-                    code_changes=[],
-                    param_changes=[],
-                    dep_changes=[],
-                    upstream_stale=[],
-                )
+                will_run=False,
+                is_forced=False,
+                reason="",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[],
+                upstream_stale=[],
+            )
 
     # Hash dependencies - with optional fallback for missing files
     if allow_missing:

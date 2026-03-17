@@ -1182,7 +1182,7 @@ async def test_coordinator_skip_avoids_worker_dispatch(
         stage_info["params"], "skip_stage", parameters.ParamsOverrides()
     )
 
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         dep_hash, _ = cache.hash_file(input_path, state_db)
         out_hash, _ = cache.hash_file(output_path, state_db)
 
@@ -1262,7 +1262,7 @@ async def test_all_cached_pipeline_skips_without_workers(
         stage_info["params"], "cached_stage", parameters.ParamsOverrides()
     )
 
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         dep_hash, _ = cache.hash_file(input_path, state_db)
         out_hash, _ = cache.hash_file(output_path, state_db)
 
@@ -1394,7 +1394,7 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
     # Write lock data and file hashes — but do NOT record dep generations.
     # This makes Tier 1 (can_skip_via_generation) return False,
     # forcing the code through Tier 2 (skip.check_stage).
-    with state_mod.StateDB(state_dir / "state.db") as state_db:
+    with state_mod.StateDB(state_dir) as state_db:
         dep_hash, _ = cache.hash_file(input_path, state_db)
         out_hash, _ = cache.hash_file(output_path, state_db)
 

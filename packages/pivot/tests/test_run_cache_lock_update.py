@@ -97,7 +97,7 @@ def test_run_cache_skip_updates_lock_file(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -187,7 +187,7 @@ def test_explain_shows_cached_after_run_cache_skip(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
@@ -312,7 +312,7 @@ def test_run_cache_skip_does_not_increment_output_generations(
         run_id="run_1",
     )
 
-    state_db_path = tmp_path / ".pivot" / "state.db"
+    state_db_path = tmp_path / ".pivot"
 
     # Step 1: First run - creates lock file with state A, output gen -> 1
     result1 = executor.execute_stage("test_stage", stage_info, worker_env, output_queue)
