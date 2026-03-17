@@ -83,8 +83,8 @@ def _find_tracked_hash(
 
 
 def _state_db_exists(state_dir: pathlib.Path) -> bool:
-    """Return True when the LMDB data file already exists."""
-    return (state_dir / "state.lmdb" / "data.mdb").exists()
+    """Return True when the LMDB directory already exists."""
+    return (state_dir / "state.lmdb").exists()
 
 
 def get_stage_explanation(
