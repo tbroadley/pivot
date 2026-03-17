@@ -325,7 +325,6 @@ def get_state_dir() -> pathlib.Path:
     return state_dir
 
 
-
 def get_max_workers() -> int:
     """Get max workers from merged config."""
     merged = get_merged_config()

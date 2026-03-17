@@ -1544,7 +1544,9 @@ class Engine:
         def _get_skip_state_db() -> state_mod.StateDB:
             if skip_state_dbs is not None:
                 if stage_state_dir not in skip_state_dbs:
-                    skip_state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir, readonly=True)
+                    skip_state_dbs[stage_state_dir] = state_mod.StateDB(
+                        stage_state_dir, readonly=True
+                    )
                 return skip_state_dbs[stage_state_dir]
             return state_mod.StateDB(stage_state_dir, readonly=True)
 
