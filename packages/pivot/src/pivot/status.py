@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import os
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
@@ -101,6 +102,13 @@ def _discover_tracked_files(
     return tracked_files, tracked_trie
 
 
+def _status_max_workers(stage_count: int) -> int:
+    configured_max_workers = config.get_max_workers()
+    if configured_max_workers < 0:
+        configured_max_workers = (os.cpu_count() or 1) + configured_max_workers
+    return max(1, min(configured_max_workers, 8, stage_count))
+
+
 def _get_explanations_in_parallel(
     execution_order: list[str],
     overrides: parameters.ParamsOverrides | None,
@@ -112,7 +120,7 @@ def _get_explanations_in_parallel(
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
-    max_workers = min(8, len(execution_order))
+    max_workers = _status_max_workers(len(execution_order))
     explanations_by_name = dict[str, StageExplanation]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

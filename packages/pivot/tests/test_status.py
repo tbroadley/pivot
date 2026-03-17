@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Annotated, TypedDict
 import pytest
 
 from helpers import register_test_stage
-from pivot import exceptions, executor, explain, loaders, outputs, status
+from pivot import config, exceptions, executor, explain, loaders, outputs, status
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, track
@@ -211,6 +211,22 @@ def test_pipeline_status_uses_per_stage_state_dir(
         # Fallback: state_dir passed positionally (7th arg, index 6)
         len(call_kwargs.args) > 6 and call_kwargs.args[6] == custom_state_dir
     ), f"state_dir not set to custom path; call_args={call_kwargs}"
+
+
+def test_status_max_workers_respects_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "get_max_workers", lambda: 4)
+    assert status._status_max_workers(20) == 4
+
+
+def test_status_max_workers_caps_at_eight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "get_max_workers", lambda: 20)
+    assert status._status_max_workers(20) == 8
+
+
+def test_status_max_workers_handles_negative_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "get_max_workers", lambda: -2)
+    monkeypatch.setattr("os.cpu_count", lambda: 10)
+    assert status._status_max_workers(20) == 8
 
 
 # =============================================================================
