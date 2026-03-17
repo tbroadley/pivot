@@ -47,7 +47,6 @@ async def test_engine_writes_run_history(
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
-    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # Run the stage
     collector = sinks.ResultCollectorSink()
@@ -88,7 +87,6 @@ async def test_engine_run_history_contains_stage_records(
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
-    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # Run the stage
@@ -132,7 +130,6 @@ async def test_engine_writes_run_cache_entry(
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / "state"
     monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
-    monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
     monkeypatch.setattr(config, "get_state_dir", lambda: state_dir)
 
     # First run - executes the stage

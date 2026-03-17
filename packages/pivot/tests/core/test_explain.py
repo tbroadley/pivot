@@ -349,6 +349,32 @@ def test_get_stage_explanation_unchanged(tmp_path: Path) -> None:
     assert result["dep_changes"] == []
 
 
+def test_get_stage_explanation_without_state_db_has_no_side_effects(tmp_path: Path) -> None:
+    """Does not create state.lmdb when explain falls back to hash-based checks."""
+    stage_lock = lock.StageLock("unchanged_stage", tmp_path / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={"self:unchanged_stage": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={},
+        )
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="unchanged_stage",
+        fingerprint={"self:unchanged_stage": "abc123"},
+        deps=[],
+        outs_paths=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=tmp_path,
+    )
+
+    assert result["will_run"] is False
+    assert not (tmp_path / "state.lmdb").exists(), "explain should not create state.lmdb"
+
+
 def test_get_stage_explanation_code_changed(tmp_path: Path) -> None:
     """Returns detailed code changes when code differs."""
     stage_lock = lock.StageLock("code_stage", tmp_path / "stages")

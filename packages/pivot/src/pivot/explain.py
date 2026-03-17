@@ -82,6 +82,11 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
+def _state_db_exists(state_dir: pathlib.Path) -> bool:
+    """Return True when the LMDB data file already exists."""
+    return (state_dir / "state.lmdb" / "data.mdb").exists()
+
+
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -133,29 +138,31 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    # Check generation tracking first (O(1) skip detection)
-    # Use verify_files=False since status predicts run behavior after restoration
-    with state.StateDB(state_dir, readonly=True) as state_db:
-        if not force and worker.can_skip_via_generation(
-            stage_name=stage_name,
-            fingerprint=fingerprint,
-            deps=deps,
-            outs_paths=outs_paths,
-            current_params=current_params,
-            lock_data=lock_data,
-            state_db=state_db,
-            verify_files=False,
-        ):
-            return StageExplanation(
+    # Check generation tracking first (O(1) skip detection) when StateDB exists.
+    # explain/status should not create state.lmdb as a side effect.
+    # Use verify_files=False since status predicts run behavior after restoration.
+    if _state_db_exists(state_dir):
+        with state.StateDB(state_dir, readonly=True) as state_db:
+            if not force and worker.can_skip_via_generation(
                 stage_name=stage_name,
-                will_run=False,
-                is_forced=False,
-                reason="",
-                code_changes=[],
-                param_changes=[],
-                dep_changes=[],
-                upstream_stale=[],
-            )
+                fingerprint=fingerprint,
+                deps=deps,
+                outs_paths=outs_paths,
+                current_params=current_params,
+                lock_data=lock_data,
+                state_db=state_db,
+                verify_files=False,
+            ):
+                return StageExplanation(
+                    stage_name=stage_name,
+                    will_run=False,
+                    is_forced=False,
+                    reason="",
+                    code_changes=[],
+                    param_changes=[],
+                    dep_changes=[],
+                    upstream_stale=[],
+                )
 
     # Hash dependencies - with optional fallback for missing files
     if allow_missing:
