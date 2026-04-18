@@ -847,13 +847,10 @@ def test_h16_missing_cache_triggers_rerun(
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
 
-    # Also clear run cache (in state.db) by removing state.db
-    state_db = tmp_path / ".pivot/state.db"
-    state_db_lock = tmp_path / ".pivot/state.db-lock"
-    if state_db.exists():
-        state_db.unlink()
-    if state_db_lock.exists():
-        state_db_lock.unlink()
+    # Also clear run cache by removing state.lmdb
+    state_lmdb = tmp_path / ".pivot/state.lmdb"
+    if state_lmdb.exists():
+        shutil.rmtree(state_lmdb)
 
     # Corrupt output
     (results_dir / "a.json").unlink()

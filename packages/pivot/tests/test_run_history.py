@@ -196,7 +196,7 @@ def test_deserialize_run_cache_entry_missing_keys() -> None:
 
 def test_state_db_write_read_run(tmp_path: pathlib.Path) -> None:
     """StateDB should write and read run manifests."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         manifest = run_history.RunManifest(
             run_id="20250110_143000_abc12345",
             started_at="2025-01-10T14:30:00+00:00",
@@ -222,14 +222,14 @@ def test_state_db_write_read_run(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_read_nonexistent_run(tmp_path: pathlib.Path) -> None:
     """StateDB should return None for nonexistent run."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         result = db.read_run("nonexistent")
         assert result is None
 
 
 def test_state_db_list_runs_ordering(tmp_path: pathlib.Path) -> None:
     """StateDB should list runs in reverse chronological order."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Write runs with different timestamps
         for i in range(3):
             manifest = run_history.RunManifest(
@@ -252,7 +252,7 @@ def test_state_db_list_runs_ordering(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_list_runs_limit(tmp_path: pathlib.Path) -> None:
     """StateDB should respect limit parameter."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         for i in range(5):
             manifest = run_history.RunManifest(
                 run_id=f"2025011{i}_143000_abc12345",
@@ -270,7 +270,7 @@ def test_state_db_list_runs_limit(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs(tmp_path: pathlib.Path) -> None:
     """StateDB should prune old runs beyond retention limit."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Write 5 runs
         for i in range(5):
             manifest = run_history.RunManifest(
@@ -296,7 +296,7 @@ def test_state_db_prune_runs(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs_no_op_when_under_limit(tmp_path: pathlib.Path) -> None:
     """StateDB prune should do nothing when under limit."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         manifest = run_history.RunManifest(
             run_id="20250110_143000_abc12345",
             started_at="",
@@ -321,7 +321,7 @@ def test_state_db_prune_runs_no_op_when_under_limit(tmp_path: pathlib.Path) -> N
 
 def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
     """StateDB should write and lookup run cache entries."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry = run_history.RunCacheEntry(
             run_id="20250110_143000_abc12345",
             output_hashes=[run_history.OutputHashEntry(path="out.txt", hash="abc")],
@@ -336,14 +336,14 @@ def test_state_db_run_cache_write_lookup(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_run_cache_lookup_nonexistent(tmp_path: pathlib.Path) -> None:
     """StateDB should return None for nonexistent run cache entry."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         result = db.lookup_run_cache("nonexistent", "nonexistent")
         assert result is None
 
 
 def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
     """Run cache entries for different stages should be independent."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry1 = run_history.RunCacheEntry(
             run_id="run1",
             output_hashes=[run_history.OutputHashEntry(path="out1.txt", hash="hash1")],
@@ -368,7 +368,7 @@ def test_state_db_run_cache_different_stages(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_run_cache_overwrite(tmp_path: pathlib.Path) -> None:
     """Writing to same run cache key should overwrite."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         entry1 = run_history.RunCacheEntry(run_id="run1", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="run2", output_hashes=[])
 
@@ -382,7 +382,7 @@ def test_state_db_run_cache_overwrite(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_run_cache(tmp_path: pathlib.Path) -> None:
     """Run cache pruning should remove entries referencing invalid run_ids."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Create cache entries with different run_ids
         entry1 = run_history.RunCacheEntry(run_id="valid_run", output_hashes=[])
         entry2 = run_history.RunCacheEntry(run_id="orphan_run", output_hashes=[])
@@ -402,7 +402,7 @@ def test_state_db_prune_run_cache(tmp_path: pathlib.Path) -> None:
 
 def test_state_db_prune_runs_also_prunes_cache(tmp_path: pathlib.Path) -> None:
     """Pruning runs should also prune run cache entries referencing deleted runs."""
-    with state.StateDB(tmp_path / "state.db") as db:
+    with state.StateDB(tmp_path) as db:
         # Create 3 runs
         for i in range(3):
             manifest = run_history.RunManifest(

@@ -1906,7 +1906,7 @@ def test_executor_deferred_writes_applied(
     assert results["process"]["status"] == "ran"
 
     # Verify StateDB has output generation incremented
-    db_path = pipeline_dir / ".pivot" / "state.db"
+    db_path = pipeline_dir / ".pivot"
     with state.StateDB(db_path, readonly=True) as db:
         output_path = pipeline_dir / "output.txt"
         output_gen = db.get_generation(output_path)
@@ -1937,7 +1937,7 @@ def test_executor_multi_stage_generation_tracking(
     assert results["step1"]["status"] == "ran"
     assert results["step2"]["status"] == "ran"
 
-    db_path = pipeline_dir / ".pivot" / "state.db"
+    db_path = pipeline_dir / ".pivot"
     with state.StateDB(db_path, readonly=True) as db:
         step1_gen = db.get_generation(pipeline_dir / "step1.txt")
         step2_gen = db.get_generation(pipeline_dir / "step2.txt")

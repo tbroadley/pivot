@@ -95,7 +95,7 @@ def _apply_deferred_writes(
     state_dir = stage_info["state_dir"]
     out_paths = [str(out.path) for out in stage_info["outs"]]
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(state_dir) as state_db:
         state_db.apply_deferred_writes(stage_name, out_paths, deferred)
 
 

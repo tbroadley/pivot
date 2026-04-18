@@ -160,7 +160,7 @@ def _find_producer_via_scan(
 class Pipeline:
     """A pipeline with its own stage registry and state directory.
 
-    Each pipeline maintains isolated state (lock files, state.db) while
+    Each pipeline maintains isolated state (lock files, state.lmdb) while
     sharing the project-wide cache.
 
     Args:
@@ -221,7 +221,7 @@ class Pipeline:
 
     @property
     def state_dir(self) -> pathlib.Path:
-        """State directory for this pipeline's lock files and state.db."""
+        """State directory for this pipeline's lock files and state database."""
         return self._root / ".pivot"
 
     def _resolve_path(self, annotation_path: str) -> str:

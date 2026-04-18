@@ -352,7 +352,7 @@ def test_pipeline_include_preserves_state_dir_transitively(set_project_root: pat
     """Transitive inclusion should preserve original state_dir through multiple levels.
 
     When A includes B and B includes C, C's stages in A should retain C's state_dir.
-    Critical for ensuring lock files and state.db remain in correct locations.
+    Critical for ensuring lock files and state database remain in correct locations.
     """
     # Level 1: Base pipeline
     base = Pipeline("base", root=set_project_root / "base")

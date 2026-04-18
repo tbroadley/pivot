@@ -139,7 +139,7 @@ def test_lazy_resolution_builds_complete_dag(set_project_root: pathlib.Path) -> 
 def test_lazy_resolution_preserves_parent_state_dir(set_project_root: pathlib.Path) -> None:
     """Included parent stages should retain their original state_dir.
 
-    Critical for correctness: lock files and state.db must remain in parent's
+    Critical for correctness: lock files and state database must remain in parent's
     .pivot directory, not child's, to avoid conflicts and enable proper
     incremental builds.
     """

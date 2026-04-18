@@ -186,7 +186,7 @@ def test_execute_stage_generation_skip_avoids_hashing(
 
     state_dir = tmp_path / ".pivot"
     with _chdir_and_reset_project_root(tmp_path):
-        with state.StateDB(state_dir / "state.db") as state_db:
+        with state.StateDB(state_dir) as state_db:
             dep_hash, _ = cache.hash_file(dep_path, state_db)
             state_db.increment_generation(dep_path)
             dep_gen = state_db.get_generation(dep_path)
@@ -232,7 +232,7 @@ def test_execute_stage_hashes_when_generation_missing(
 
     state_dir = tmp_path / ".pivot"
     with _chdir_and_reset_project_root(tmp_path):
-        with state.StateDB(state_dir / "state.db") as state_db:
+        with state.StateDB(state_dir) as state_db:
             dep_hash, _ = cache.hash_file(dep_path, state_db)
             normalized_dep = str(project.normalize_path("input.txt"))
             state_db.record_dep_generations(stage_name, {normalized_dep: 1})
@@ -1946,7 +1946,7 @@ def test_file_needs_restore_uses_state_db(tmp_path: pathlib.Path) -> None:
     """_file_needs_restore accepts state_db parameter for hash caching."""
     file_path = tmp_path / "output.txt"
     file_path.write_text("content")
-    db_path = tmp_path / "state.db"
+    db_path = tmp_path
 
     with state.StateDB(db_path) as db:
         file_hash, _ = cache.hash_file(file_path, db)
@@ -2038,7 +2038,7 @@ def test_run_cache_skip_with_directory_out(
     # Manually write the run cache entry (normally done by coordinator)
     deferred = result1.get("deferred_writes", {})
     if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
-        state_db = state.StateDB(tmp_path / ".pivot" / "state.db")
+        state_db = state.StateDB(tmp_path / ".pivot")
         state_db.write_run_cache(
             "test_run_cache_dir", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
         )
@@ -2093,7 +2093,7 @@ def test_run_cache_skip_restores_corrupted_directory(
     # Manually write the run cache entry (normally done by coordinator)
     deferred = result1.get("deferred_writes", {})
     if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
-        state_db = state.StateDB(tmp_path / ".pivot" / "state.db")
+        state_db = state.StateDB(tmp_path / ".pivot")
         state_db.write_run_cache(
             "test_run_cache_corrupt", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
         )
@@ -2209,7 +2209,7 @@ def test_try_skip_via_run_cache_returns_none_for_incremental_out(
 
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
-    state_db = state.StateDB(state_dir / "state.db")
+    state_db = state.StateDB(state_dir)
 
     incremental_out = outputs.IncrementalOut("output.txt", loaders.PathOnly())
 
@@ -2234,7 +2234,7 @@ def test_try_skip_via_run_cache_returns_none_when_no_entry(
 
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
-    state_db = state.StateDB(state_dir / "state.db")
+    state_db = state.StateDB(state_dir)
 
     out = outputs.Out(str(tmp_path / "output.txt"), loaders.PathOnly())
 
@@ -2599,7 +2599,7 @@ def test_build_deferred_writes_excludes_noncached_from_run_cache(
     """
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
-    state_db = state.StateDB(state_dir / "state.db")
+    state_db = state.StateDB(state_dir)
 
     out = outputs.Out("output.txt", loader=loaders.PathOnly())
     metric = outputs.Metric("metrics.json")
@@ -2639,7 +2639,7 @@ def test_build_deferred_writes_no_run_cache_when_all_noncached(
     """
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
-    state_db = state.StateDB(state_dir / "state.db")
+    state_db = state.StateDB(state_dir)
 
     metric1 = outputs.Metric("metrics1.json")
     metric2 = outputs.Metric("metrics2.json")
@@ -2697,7 +2697,7 @@ def test_run_cache_skip_with_mixed_cached_and_noncached_outputs(
     # Apply deferred writes (run cache entry) to state DB
     deferred = result1.get("deferred_writes", {})
     if "run_cache_input_hash" in deferred and "run_cache_entry" in deferred:
-        with state.StateDB(tmp_path / ".pivot" / "state.db") as state_db:
+        with state.StateDB(tmp_path / ".pivot") as state_db:
             state_db.write_run_cache(
                 "test_mixed_rc", deferred["run_cache_input_hash"], deferred["run_cache_entry"]
             )
@@ -2750,7 +2750,7 @@ def test_build_deferred_writes_sets_increment_outputs_true_by_default(
         "output.txt": FileHash(hash="abc123"),
     }
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(state_dir) as state_db:
         result = worker._build_deferred_writes(stage_info, "input_hash_1", output_hashes, state_db)
 
     assert "increment_outputs" in result
@@ -2781,7 +2781,7 @@ def test_build_deferred_writes_omits_increment_outputs_when_false(
         "output.txt": FileHash(hash="abc123"),
     }
 
-    with state.StateDB(state_dir / "state.db") as state_db:
+    with state.StateDB(state_dir) as state_db:
         result = worker._build_deferred_writes(
             stage_info, "input_hash_1", output_hashes, state_db, increment_outputs=False
         )

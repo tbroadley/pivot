@@ -723,7 +723,7 @@ async def test_push_async_integration(
     cache_path2.write_bytes(b"content2")
 
     state_dir.mkdir(parents=True, exist_ok=True)
-    state_db = state_mod.StateDB(state_dir / "state.db")
+    state_db = state_mod.StateDB(state_dir)
 
     await transfer._push_async(cache_dir, state_dir, s3_remote, state_db, "origin")
 
@@ -754,7 +754,7 @@ async def test_pull_async_integration(
     cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True)
 
-    state_db = state_mod.StateDB(state_dir / "state.db")
+    state_db = state_mod.StateDB(state_dir)
 
     await transfer._pull_async(cache_dir, state_dir, s3_remote, state_db, "origin")
 
@@ -781,14 +781,14 @@ async def test_push_pull_roundtrip_integration(
     cache_path1.parent.mkdir(parents=True, exist_ok=True)
     cache_path1.write_bytes(b"original")
 
-    state_db1 = state_mod.StateDB(state_dir1 / "state.db")
+    state_db1 = state_mod.StateDB(state_dir1)
 
     await transfer._push_async(cache_dir1, state_dir1, s3_remote, state_db1, "origin")
 
     state_dir2 = tmp_path / ".pivot2"
     cache_dir2 = state_dir2 / "cache"
     cache_dir2.mkdir(parents=True)
-    state_db2 = state_mod.StateDB(state_dir2 / "state.db")
+    state_db2 = state_mod.StateDB(state_dir2)
 
     await transfer._pull_async(cache_dir2, state_dir2, s3_remote, state_db2, "origin")
 
@@ -820,7 +820,7 @@ async def test_compare_status_integration(
 
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir(parents=True, exist_ok=True)
-    state_db = state_mod.StateDB(state_dir / "state.db")
+    state_db = state_mod.StateDB(state_dir)
 
     status = await transfer.compare_status(
         {hash_common, hash_local_only},
@@ -869,7 +869,7 @@ async def test_pull_async_with_deps_integration(
     with lock_path.open("w") as f:
         yaml.dump(lock_data, f)
 
-    state_db = state_mod.StateDB(state_dir / "state.db")
+    state_db = state_mod.StateDB(state_dir)
 
     await transfer._pull_async(
         cache_dir,
