@@ -114,6 +114,11 @@ def _setup_resolve_mocks(
         return_value=["train.lock"],
     )
     mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
+    )
+    mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
         return_value=rev_lock,

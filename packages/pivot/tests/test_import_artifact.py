@@ -52,6 +52,11 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
+    )
     list_directory.return_value = ["train.lock"]
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
@@ -78,7 +83,7 @@ def test_resolve_remote_path_exact_file(mocker: MockerFixture) -> None:
         import_artifact.resolve_remote_path(repo_url, "data/output.csv", "main", None)
     )
 
-    assert resolved["stage"] == "train"
+    assert "stage" in resolved and resolved["stage"] == "train"
     assert resolved["path"] == "data/output.csv"
     assert resolved["hash"] == "abc123"
     assert resolved["size"] == 0
@@ -101,6 +106,11 @@ def test_resolve_remote_path_ambiguous(mocker: MockerFixture) -> None:
     list_directory = mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
     )
     list_directory.return_value = ["train.lock", "eval.lock"]
     resolve_ref = mocker.patch(
@@ -143,6 +153,11 @@ def test_resolve_remote_path_not_found(mocker: MockerFixture) -> None:
     list_directory = mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
     )
     list_directory.return_value = ["train.lock"]
     resolve_ref = mocker.patch(
@@ -207,6 +222,11 @@ async def test_import_artifact_creates_pvt(
     list_directory = mocker.patch(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
     )
     list_directory.return_value = ["train.lock"]
     resolve_ref = mocker.patch(
@@ -278,6 +298,11 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
+    )
     list_directory.return_value = ["train.lock"]
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
@@ -348,6 +373,11 @@ async def test_import_artifact_force_overwrites(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
     )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
+    )
     list_directory.return_value = ["train.lock"]
     resolve_ref = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
@@ -402,3 +432,246 @@ async def test_import_artifact_force_overwrites(
     assert pvt_data is not None
     assert pvt_data["hash"] == file_hash
     assert pvt_data["size"] == len(content), "Size should come from downloaded file"
+
+
+# ── Tracked-file (.pvt) resolution ────────────────────────────
+
+
+def _pvt_bytes(
+    *, path: str, hash: str, size: int, manifest: list[dict[str, object]] | None = None
+) -> bytes:
+    data: dict[str, object] = {"path": path, "hash": hash, "size": size}
+    if manifest is not None:
+        data["manifest"] = manifest
+    return yaml.safe_dump(data).encode()
+
+
+def test_resolve_remote_path_tracked_pvt_alongside_lock(mocker: MockerFixture) -> None:
+    repo_url = "https://github.com/org/repo"
+    remote_url = "s3://bucket/prefix"
+
+    mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+        return_value=["train.lock"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=["data/foo.csv.pvt", "data/other.csv.pvt"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+        return_value="deadbeef",
+    )
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes | None:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == ".pivot/stages/train.lock":
+            return _lock_bytes(outs=[{"path": "data/from_stage.csv", "hash": "stagehash"}])
+        if path == "data/foo.csv.pvt":
+            return _pvt_bytes(path="foo.csv", hash="abc123", size=42)
+        if path == "data/other.csv.pvt":
+            return _pvt_bytes(path="other.csv", hash="otherhash", size=7)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+        side_effect=_read_file,
+    )
+
+    resolved = asyncio.run(
+        import_artifact.resolve_remote_path(repo_url, "data/foo.csv", "main", None)
+    )
+
+    assert resolved["path"] == "data/foo.csv"
+    assert resolved["hash"] == "abc123"
+    assert resolved["size"] == 42
+    assert resolved["remote_url"] == remote_url
+    assert "stage" not in resolved, "Tracked-file imports should not record a stage"
+
+
+def test_resolve_remote_path_tracked_pvt_manifest_entry(mocker: MockerFixture) -> None:
+    repo_url = "https://github.com/org/repo"
+    remote_url = "s3://bucket/prefix"
+
+    mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+        return_value=["train.lock"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=["images.pvt"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+        return_value="deadbeef",
+    )
+
+    manifest: list[dict[str, object]] = [
+        {"relpath": "a.png", "hash": "ah", "size": 10, "isexec": False},
+        {"relpath": "b.png", "hash": "bh", "size": 20, "isexec": False},
+    ]
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes | None:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == ".pivot/stages/train.lock":
+            return _lock_bytes(outs=[{"path": "unrelated.csv", "hash": "x"}])
+        if path == "images.pvt":
+            return _pvt_bytes(path="images", hash="dirhash", size=30, manifest=manifest)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+        side_effect=_read_file,
+    )
+
+    resolved = asyncio.run(
+        import_artifact.resolve_remote_path(repo_url, "images/a.png", "main", None)
+    )
+
+    assert resolved["hash"] == "ah"
+    assert resolved["size"] == 10
+    assert "stage" not in resolved
+
+
+def test_resolve_remote_path_tracked_pvt_directory_rejected(mocker: MockerFixture) -> None:
+    repo_url = "https://github.com/org/repo"
+    remote_url = "s3://bucket/prefix"
+
+    mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+        return_value=["train.lock"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=["images.pvt"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+        return_value="deadbeef",
+    )
+
+    manifest: list[dict[str, object]] = [
+        {"relpath": "a.png", "hash": "ah", "size": 10, "isexec": False}
+    ]
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes | None:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == ".pivot/stages/train.lock":
+            return _lock_bytes(outs=[{"path": "unrelated.csv", "hash": "x"}])
+        if path == "images.pvt":
+            return _pvt_bytes(path="images", hash="dirhash", size=10, manifest=manifest)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+        side_effect=_read_file,
+    )
+
+    with pytest.raises(exceptions.PivotError, match="Cannot import directory"):
+        asyncio.run(import_artifact.resolve_remote_path(repo_url, "images", "main", None))
+
+
+def test_resolve_remote_path_lock_pvt_collision(mocker: MockerFixture) -> None:
+    repo_url = "https://github.com/org/repo"
+    remote_url = "s3://bucket/prefix"
+
+    mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+        return_value=["train.lock"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=["data/foo.csv.pvt"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+        return_value="deadbeef",
+    )
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes | None:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == ".pivot/stages/train.lock":
+            return _lock_bytes(outs=[{"path": "data/foo.csv", "hash": "stagehash"}])
+        if path == "data/foo.csv.pvt":
+            return _pvt_bytes(path="foo.csv", hash="pvthash", size=5)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+        side_effect=_read_file,
+    )
+
+    with pytest.raises(exceptions.PivotError, match="multiple sources"):
+        asyncio.run(import_artifact.resolve_remote_path(repo_url, "data/foo.csv", "main", None))
+
+
+def test_resolve_remote_path_tracked_only_no_stages(mocker: MockerFixture) -> None:
+    """Repo with only `pivot track`-ed files and no stages should still resolve."""
+    repo_url = "https://github.com/org/repo"
+    remote_url = "s3://bucket/prefix"
+
+    mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+        return_value=None,  # .pivot/stages does not exist
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=["data/foo.csv.pvt"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+        return_value="deadbeef",
+    )
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes | None:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == "data/foo.csv.pvt":
+            return _pvt_bytes(path="foo.csv", hash="abc123", size=42)
+        raise AssertionError(f"Unexpected path: {path}")
+
+    mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+        side_effect=_read_file,
+    )
+
+    resolved = asyncio.run(
+        import_artifact.resolve_remote_path(repo_url, "data/foo.csv", "main", None)
+    )
+
+    assert resolved["hash"] == "abc123"
+    assert "stage" not in resolved

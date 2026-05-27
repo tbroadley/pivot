@@ -486,6 +486,11 @@ async def test_full_import_flow_mocked(
         autospec=True,
         return_value=["train.lock"],
     )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
+    )
     resolve_ref_mock = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",
         autospec=True,
