@@ -116,6 +116,49 @@ def read_file_from_remote_repo(
         return None
 
 
+def fetch_pvt_files_from_remote_repo(
+    repo_url: str,
+    rev: str,
+    *,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> dict[str, bytes] | None:
+    """Download repo at *rev* via ``git archive`` and return ``{path: bytes}``
+    for every ``*.pvt`` file in the tree.
+
+    Returns ``None`` on failure. Returns an empty dict if the repo has no
+    ``.pvt`` files.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "archive", f"--remote={repo_url}", rev],
+            capture_output=True,
+            timeout=timeout,
+            check=True,
+        )
+        out: dict[str, bytes] = {}
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
+            for member in tar.getmembers():
+                if not member.isfile() or not member.name.endswith(".pvt"):
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                out[member.name] = f.read()
+        return out
+    except subprocess.CalledProcessError as e:
+        logger.debug("git archive failed: %s", e.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("git archive timed out for %s after %ds", repo_url, timeout)
+        return None
+    except FileNotFoundError:
+        logger.warning("git command not found")
+        return None
+    except (tarfile.TarError, OSError) as e:
+        logger.debug("Failed to extract tar: %s", e)
+        return None
+
+
 def list_directory_from_remote_repo(
     repo_url: str,
     path: str,

@@ -4,7 +4,8 @@ import asyncio
 import functools
 import logging
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, cast
+import posixpath
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import aiohttp
 import yaml
@@ -25,12 +26,12 @@ logger = logging.getLogger(__name__)
 
 
 class ResolvedImport(TypedDict):
-    stage: str
     path: str
     hash: str
     size: int
     remote_url: str
     rev_lock: str
+    stage: NotRequired[str]  # omitted for `pivot track`-ed source files
 
 
 class ImportResult(TypedDict):
@@ -153,20 +154,16 @@ async def list_remote_lock_files(
             rev,
         )
 
+    # Missing .pivot/stages or no lock files is fine — the repo may only use
+    # `pivot track`, in which case resolution falls back to .pvt files.
     if entries is None:
-        raise exceptions.RemoteError("Remote repo has no .pivot/stages directory")
+        return []
 
-    stage_names = list[str]()
-    for entry in [str(e) for e in entries]:
-        name = pathlib.Path(entry).name
-        if not name.endswith(".lock"):
-            continue
-        stage_names.append(name[: -len(".lock")])
-
-    if not stage_names:
-        raise exceptions.RemoteError("Remote repo has no lock files")
-
-    return stage_names
+    return [
+        pathlib.Path(str(e)).name[: -len(".lock")]
+        for e in entries
+        if pathlib.Path(str(e)).name.endswith(".lock")
+    ]
 
 
 async def read_remote_lock_file(
@@ -219,6 +216,109 @@ async def resolve_remote_path(
         return await _resolve_remote_path_with_session(repo_url, path, rev, token, session)
 
 
+class _Match(TypedDict):
+    source: str  # Human-readable origin: stage name, or ".pvt file: <path>"
+    stage: NotRequired[str]  # Stage name when match came from a lock file
+    path: str
+    hash: str
+    size: int
+
+
+async def _list_remote_pvt_files(
+    repo_url: str,
+    rev: str,
+    token: str | None,
+    *,
+    session: aiohttp.ClientSession | None,
+) -> dict[str, bytes]:
+    """Return ``{pvt_path: bytes}`` for every ``*.pvt`` file in the remote tree at *rev*."""
+    if github.is_github_url(repo_url):
+        owner, repo = github.parse_github_url(repo_url)
+        paths = await github.list_tree(
+            owner, repo, rev, _maybe_token(repo_url, token), session=session
+        )
+        if not paths:
+            return {}
+        pvt_paths = [p for p in paths if p.endswith(".pvt")]
+        contents = await asyncio.gather(
+            *[
+                github.read_file(
+                    owner, repo, p, rev, _maybe_token(repo_url, token), session=session
+                )
+                for p in pvt_paths
+            ]
+        )
+        return {p: c for p, c in zip(pvt_paths, contents, strict=True) if c is not None}
+    result = await _run_blocking(git_archive.fetch_pvt_files_from_remote_repo, repo_url, rev)
+    return result or {}
+
+
+def _pvt_data_path(pvt_path: str, data_relpath: str) -> str:
+    return posixpath.normpath(posixpath.join(posixpath.dirname(pvt_path), data_relpath))
+
+
+def _collect_pvt_matches(
+    pvt_files: dict[str, bytes],
+    requested: str,
+    available: set[str],
+) -> list[_Match]:
+    matches: list[_Match] = []
+    for pvt_path, raw in pvt_files.items():
+        try:
+            data = cast("object", yaml.safe_load(raw))
+        except yaml.YAMLError:
+            logger.warning("Failed to parse remote .pvt file '%s'", pvt_path)
+            continue
+        if not track.is_pvt_data(data):
+            logger.warning("Invalid .pvt structure at '%s'", pvt_path)
+            continue
+        # Skip import-of-import to avoid recursive resolution; users should import
+        # from the original source repo directly.
+        if track.is_import(data):
+            continue
+
+        data_full = _pvt_data_path(pvt_path, data["path"])
+        available.add(data_full)
+        manifest = data.get("manifest")
+
+        if manifest is not None:
+            for entry in manifest:
+                full = posixpath.normpath(posixpath.join(data_full, entry["relpath"]))
+                available.add(full)
+
+        if data_full == requested:
+            if manifest is not None:
+                message = (
+                    "Cannot import directory output "
+                    + f"'{requested}'. Import individual files instead, "
+                    + f"e.g., '{requested.rstrip('/')}/{{filename}}'"
+                )
+                raise exceptions.PivotError(message)
+            matches.append(
+                _Match(
+                    source=f".pvt file: {pvt_path}",
+                    path=requested,
+                    hash=data["hash"],
+                    size=int(data["size"]),
+                )
+            )
+            continue
+
+        if manifest is not None:
+            for entry in manifest:
+                full = posixpath.normpath(posixpath.join(data_full, entry["relpath"]))
+                if full == requested:
+                    matches.append(
+                        _Match(
+                            source=f".pvt file: {pvt_path}",
+                            path=requested,
+                            hash=entry["hash"],
+                            size=int(entry["size"]),
+                        )
+                    )
+    return matches
+
+
 async def _resolve_remote_path_with_session(
     repo_url: str,
     path: str,
@@ -233,8 +333,12 @@ async def _resolve_remote_path_with_session(
 
     remote_url = await read_remote_config(repo_url, rev_lock, token, session=gh_session)
 
-    # Use resolved SHA for all subsequent reads to avoid TOCTOU race
-    stage_names = await list_remote_lock_files(repo_url, rev_lock, token, session=gh_session)
+    # Use resolved SHA for all subsequent reads to avoid TOCTOU race.
+    # Fetch lock files and .pvt-tracked files in parallel.
+    stage_names, pvt_files = await asyncio.gather(
+        list_remote_lock_files(repo_url, rev_lock, token, session=gh_session),
+        _list_remote_pvt_files(repo_url, rev_lock, token, session=gh_session),
+    )
     lock_datas = await asyncio.gather(
         *[
             read_remote_lock_file(repo_url, stage, rev_lock, token, session=gh_session)
@@ -242,7 +346,7 @@ async def _resolve_remote_path_with_session(
         ]
     )
 
-    matches = list[tuple[str, str, str, int]]()
+    matches: list[_Match] = []
     available = set[str]()
 
     for stage, lock_data in zip(stage_names, lock_datas, strict=True):
@@ -261,19 +365,30 @@ async def _resolve_remote_path_with_session(
                         + f"e.g., '{path.rstrip('/')}/{{filename}}'"
                     )
                     raise exceptions.PivotError(message)
-                matches.append((stage, path, entry["hash"], _entry_size(entry)))
+                matches.append(
+                    _Match(
+                        source=stage,
+                        stage=stage,
+                        path=path,
+                        hash=entry["hash"],
+                        size=_entry_size(entry),
+                    )
+                )
                 continue
 
             for full_path, manifest_entry in _iter_manifest_paths(entry):
                 if full_path == path:
                     matches.append(
-                        (
-                            stage,
-                            path,
-                            manifest_entry["hash"],
-                            int(manifest_entry["size"]),
+                        _Match(
+                            source=stage,
+                            stage=stage,
+                            path=path,
+                            hash=manifest_entry["hash"],
+                            size=int(manifest_entry["size"]),
                         )
                     )
+
+    matches.extend(_collect_pvt_matches(pvt_files, path, available))
 
     if not matches:
         max_shown = 10
@@ -290,18 +405,20 @@ async def _resolve_remote_path_with_session(
         )
 
     if len(matches) > 1:
-        stages = ", ".join(sorted({stage for stage, _, _, _ in matches}))
-        raise exceptions.PivotError(f"Path '{path}' is produced by multiple stages: {stages}")
+        sources = ", ".join(sorted({m["source"] for m in matches}))
+        raise exceptions.PivotError(f"Path '{path}' is produced by multiple sources: {sources}")
 
-    stage, matched_path, hash_, size = matches[0]
-    return ResolvedImport(
-        stage=stage,
-        path=matched_path,
-        hash=hash_,
-        size=size,
+    match = matches[0]
+    resolved = ResolvedImport(
+        path=match["path"],
+        hash=match["hash"],
+        size=match["size"],
         remote_url=remote_url,
         rev_lock=rev_lock,
     )
+    if "stage" in match:
+        resolved["stage"] = match["stage"]
+    return resolved
 
 
 async def import_artifact(
@@ -356,10 +473,11 @@ async def import_artifact(
         repo=repo_url,
         rev=rev,
         rev_lock=resolved["rev_lock"],
-        stage=resolved["stage"],
         path=resolved["path"],
         remote=resolved["remote_url"],
     )
+    if "stage" in resolved:
+        source["stage"] = resolved["stage"]
     pvt_data = track.PvtData(
         path=data_path.name,
         hash=resolved["hash"],
@@ -450,10 +568,11 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
             repo=source["repo"],
             rev=rev,
             rev_lock=resolved["rev_lock"],
-            stage=resolved["stage"],
             path=resolved["path"],
             remote=resolved["remote_url"],
         )
+        if "stage" in resolved:
+            new_source["stage"] = resolved["stage"]
         new_pvt = track.PvtData(
             path=pvt_data["path"],
             hash=resolved["hash"],

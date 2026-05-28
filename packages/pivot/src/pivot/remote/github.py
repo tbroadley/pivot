@@ -149,6 +149,55 @@ async def list_directory(
     return None
 
 
+async def list_tree(
+    owner: str,
+    repo: str,
+    ref: str,
+    token: str | None = None,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> list[str] | None:
+    """List all blob paths in the repo tree at *ref* (recursive).
+
+    Returns ``None`` if the tree cannot be fetched. The GitHub trees API
+    truncates results above ~100k entries or ~7MB; if truncation occurs we
+    log a warning and return what we have.
+    """
+    url = f"{_API_BASE}/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
+    if session is not None:
+        status, data = await _get(session, url, token)
+    else:
+        async with aiohttp.ClientSession() as s:
+            status, data = await _get(s, url, token)
+    if status == 404:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data_dict = typing.cast("dict[str, object]", data)
+    if data_dict.get("truncated"):
+        logger.warning(
+            "GitHub tree listing for %s/%s@%s was truncated; some .pvt files may be missed",
+            owner,
+            repo,
+            ref,
+        )
+    tree = data_dict.get("tree")
+    if not isinstance(tree, list):
+        return None
+    tree_list = typing.cast("list[object]", tree)
+    paths: list[str] = []
+    for entry in tree_list:
+        if not isinstance(entry, dict):
+            continue
+        entry_dict = typing.cast("dict[str, object]", entry)
+        if entry_dict.get("type") != "blob":
+            continue
+        path = entry_dict.get("path")
+        if isinstance(path, str):
+            paths.append(path)
+    return paths
+
+
 async def resolve_ref(
     owner: str,
     repo: str,
