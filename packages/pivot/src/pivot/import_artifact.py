@@ -5,11 +5,14 @@ import functools
 import logging
 import pathlib
 import posixpath
+import shutil
+import tempfile
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import aiohttp
 import yaml
 
+from pivot import config as pivot_config
 from pivot import exceptions, project
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github
@@ -32,6 +35,8 @@ class ResolvedImport(TypedDict):
     remote_url: str
     rev_lock: str
     stage: NotRequired[str]  # omitted for `pivot track`-ed source files
+    # Set for directory imports; omitted for single-file imports.
+    manifest: NotRequired[list[DirManifestEntry]]
 
 
 class ImportResult(TypedDict):
@@ -222,6 +227,8 @@ class _Match(TypedDict):
     path: str
     hash: str
     size: int
+    # Set for directory matches; absent for single-file matches.
+    manifest: NotRequired[list[DirManifestEntry]]
 
 
 async def _list_remote_pvt_files(
@@ -288,12 +295,16 @@ def _collect_pvt_matches(
 
         if data_full == requested:
             if manifest is not None:
-                message = (
-                    "Cannot import directory output "
-                    + f"'{requested}'. Import individual files instead, "
-                    + f"e.g., '{requested.rstrip('/')}/{{filename}}'"
+                matches.append(
+                    _Match(
+                        source=f".pvt file: {pvt_path}",
+                        path=requested,
+                        hash=data["hash"],
+                        size=int(data["size"]),
+                        manifest=list(manifest),
+                    )
                 )
-                raise exceptions.PivotError(message)
+                continue
             matches.append(
                 _Match(
                     source=f".pvt file: {pvt_path}",
@@ -359,12 +370,17 @@ async def _resolve_remote_path_with_session(
 
             if entry["path"] == path:
                 if "manifest" in entry:
-                    message = (
-                        "Cannot import directory output "
-                        + f"'{path}'. Import individual files instead, "
-                        + f"e.g., '{path.rstrip('/')}/{{filename}}'"
+                    matches.append(
+                        _Match(
+                            source=stage,
+                            stage=stage,
+                            path=path,
+                            hash=entry["hash"],
+                            size=_entry_size(entry),
+                            manifest=list(entry["manifest"]),
+                        )
                     )
-                    raise exceptions.PivotError(message)
+                    continue
                 matches.append(
                     _Match(
                         source=stage,
@@ -418,7 +434,199 @@ async def _resolve_remote_path_with_session(
     )
     if "stage" in match:
         resolved["stage"] = match["stage"]
+    if "manifest" in match:
+        resolved["manifest"] = match["manifest"]
     return resolved
+
+
+def _resolve_cache_dir(cache_dir: pathlib.Path | None) -> pathlib.Path:
+    if cache_dir is not None:
+        return cache_dir
+    return pivot_config.get_cache_dir() / "files"
+
+
+def _normalize_source_path(p: str) -> str:
+    return posixpath.normpath(p).strip("/")
+
+
+def _paths_overlap(a: str, b: str) -> bool:
+    """True if a == b, or one path is a segment-aligned prefix of the other."""
+    if a == b:
+        return True
+    a_parts = a.split("/")
+    b_parts = b.split("/")
+    if len(a_parts) < len(b_parts):
+        return b_parts[: len(a_parts)] == a_parts
+    return a_parts[: len(b_parts)] == b_parts
+
+
+def _check_import_conflicts(
+    *,
+    repo_url: str,
+    source_path: str,
+    project_root: pathlib.Path,
+    exclude_pvt: pathlib.Path | None = None,
+) -> None:
+    """Reject if any existing import .pvt overlaps source_path from the same repo.
+
+    Overlap means either equal paths or one is a directory prefix of the other
+    (e.g., importing 'data/raw/' when 'data/raw/foo.csv' is already imported, or vice
+    versa). Detection is at import time; pvt_status etc. are not affected.
+    """
+    existing = track.discover_import_pvt_files(project_root)
+    new_norm = _normalize_source_path(source_path)
+    exclude_abs = exclude_pvt.absolute() if exclude_pvt is not None else None
+
+    for data_path_str, pvt_data in existing.items():
+        existing_pvt_path = track.get_pvt_path(pathlib.Path(data_path_str)).absolute()
+        if exclude_abs is not None and existing_pvt_path == exclude_abs:
+            continue
+        existing_source = pvt_data.get("source")
+        if existing_source is None or existing_source["repo"] != repo_url:
+            continue
+        existing_norm = _normalize_source_path(existing_source["path"])
+        if _paths_overlap(new_norm, existing_norm):
+            raise exceptions.PivotError(
+                f"Import conflict: '{source_path}' from {repo_url} overlaps with "
+                + f"existing import at '{existing_pvt_path}' (source path "
+                + f"'{existing_source['path']}'). A directory import and a file "
+                + "import from the same source repo cannot cover overlapping paths."
+            )
+
+
+async def _materialize_file(
+    *, remote_url: str, file_hash: str, dest: pathlib.Path, cache_dir: pathlib.Path
+) -> None:
+    """Materialize a single file into ``dest`` from cache (hit) or remote (miss).
+
+    On miss: download, verify hash, populate cache. On hit: copy from cache.
+    """
+    cache_path = cache.get_cache_path(cache_dir, file_hash)
+    if cache_path.exists():
+        shutil.copyfile(cache_path, dest)
+        return
+
+    remote = remote_storage.S3Remote(remote_url)
+    await remote.download_file(file_hash, dest)
+    actual_hash, _ = cache.hash_file(dest)
+    if actual_hash != file_hash:
+        dest.unlink(missing_ok=True)
+        raise exceptions.RemoteError(
+            f"Downloaded file hash mismatch: expected {file_hash}, got {actual_hash}"
+        )
+    try:
+        cache.copy_to_cache(dest, cache_path)
+    except OSError as exc:
+        logger.warning("Failed to populate cache for %s: %s", file_hash, exc)
+
+
+async def _materialize_directory(
+    *, resolved: ResolvedImport, data_path: pathlib.Path, cache_dir: pathlib.Path
+) -> None:
+    """Materialize a directory import: stage all files, then atomically swap into place.
+
+    Files already present in the local cache (by content hash) are copied from cache
+    instead of downloaded — this gives delta updates "for free" when only a subset
+    of the upstream manifest has changed.
+
+    Atomicity: on any per-file failure the staging directory is removed and no
+    changes are made to ``data_path``. Hash mismatches never retry (corruption
+    signal); transient S3 errors are retried by the S3 client itself.
+    """
+    assert "manifest" in resolved, "_materialize_directory called on a non-directory import"
+    manifest = resolved["manifest"]
+
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    staging = pathlib.Path(
+        tempfile.mkdtemp(prefix=f".{data_path.name}.import-", dir=data_path.parent)
+    )
+
+    try:
+        download_items: list[tuple[str, pathlib.Path]] = []
+        cache_items: list[tuple[pathlib.Path, pathlib.Path]] = []
+        for entry in manifest:
+            staged = staging / entry["relpath"]
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            cache_path = cache.get_cache_path(cache_dir, entry["hash"])
+            if cache_path.exists():
+                cache_items.append((cache_path, staged))
+            else:
+                download_items.append((entry["hash"], staged))
+
+        for cache_path, staged in cache_items:
+            shutil.copyfile(cache_path, staged)
+
+        if download_items:
+            remote = remote_storage.S3Remote(resolved["remote_url"])
+            results = await remote.download_batch(download_items)
+            failures = [r for r in results if not r["success"]]
+            if failures:
+                err_msgs = "; ".join(r["error"] for r in failures if "error" in r)
+                raise exceptions.RemoteError(
+                    f"Failed to download {len(failures)} of {len(download_items)} "
+                    + f"files for directory import: {err_msgs}"
+                )
+
+        # Verify hashes for downloaded files; cache hits are trusted by construction.
+        for blob_hash, staged in download_items:
+            actual_hash, _ = cache.hash_file(staged)
+            if actual_hash != blob_hash:
+                raise exceptions.RemoteError(
+                    f"Hash mismatch for downloaded blob: expected {blob_hash}, "
+                    + f"got {actual_hash}"
+                )
+
+        for entry in manifest:
+            if entry["isexec"]:
+                staged = staging / entry["relpath"]
+                staged.chmod(staged.stat().st_mode | 0o111)
+
+        for blob_hash, staged in download_items:
+            cache_path = cache.get_cache_path(cache_dir, blob_hash)
+            try:
+                cache.copy_to_cache(staged, cache_path)
+            except OSError as exc:
+                logger.warning("Failed to populate cache for %s: %s", blob_hash, exc)
+
+        if data_path.exists():
+            shutil.rmtree(data_path)
+        staging.rename(data_path)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _build_source(repo_url: str, rev: str, resolved: ResolvedImport) -> track.ImportSource:
+    source = track.ImportSource(
+        repo=repo_url,
+        rev=rev,
+        rev_lock=resolved["rev_lock"],
+        path=resolved["path"],
+        remote=resolved["remote_url"],
+    )
+    if "stage" in resolved:
+        source["stage"] = resolved["stage"]
+    return source
+
+
+def _build_pvt_data(
+    *,
+    path_name: str,
+    file_size: int,
+    resolved: ResolvedImport,
+    source: track.ImportSource,
+) -> track.PvtData:
+    pvt_data = track.PvtData(
+        path=path_name,
+        hash=resolved["hash"],
+        size=file_size,
+        source=source,
+    )
+    if "manifest" in resolved:
+        manifest = resolved["manifest"]
+        pvt_data["manifest"] = manifest
+        pvt_data["num_files"] = len(manifest)
+    return pvt_data
 
 
 async def import_artifact(
@@ -430,6 +638,7 @@ async def import_artifact(
     force: bool = False,
     no_download: bool = False,
     project_root: pathlib.Path | None = None,
+    cache_dir: pathlib.Path | None = None,
 ) -> ImportResult:
     resolved = await resolve_remote_path(repo_url, path, rev, None)
 
@@ -443,14 +652,25 @@ async def import_artifact(
             f"Import destination must be within project root. Got: {data_path}"
         )
     pvt_path = track.get_pvt_path(data_path)
+    is_directory = "manifest" in resolved
+
+    _check_import_conflicts(
+        repo_url=repo_url,
+        source_path=resolved["path"],
+        project_root=project_root,
+        exclude_pvt=pvt_path if force else None,
+    )
 
     if data_path.exists() and not force:
         raise exceptions.PivotError(f"'{data_path}' already exists. Use --force to overwrite.")
     if pvt_path.exists() and not force:
         raise exceptions.PivotError(f"'{pvt_path}' already exists. Use --force to overwrite.")
 
-    if force and data_path.exists() and data_path.is_dir():
-        raise exceptions.PivotError("Cannot overwrite directory with import")
+    if force and data_path.exists():
+        if data_path.is_dir() and not is_directory:
+            raise exceptions.PivotError("Cannot overwrite directory with file import")
+        if data_path.is_file() and is_directory:
+            raise exceptions.PivotError("Cannot overwrite file with directory import")
 
     pvt_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,30 +678,26 @@ async def import_artifact(
     downloaded = False
     file_size = resolved["size"]
     if not no_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
-        downloaded = True
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Downloaded file hash mismatch: expected {resolved['hash']}, got {actual_hash}"
+        files_cache_dir = _resolve_cache_dir(cache_dir)
+        if is_directory:
+            await _materialize_directory(
+                resolved=resolved, data_path=data_path, cache_dir=files_cache_dir
             )
-        file_size = data_path.stat().st_size
+        else:
+            await _materialize_file(
+                remote_url=resolved["remote_url"],
+                file_hash=resolved["hash"],
+                dest=data_path,
+                cache_dir=files_cache_dir,
+            )
+            file_size = data_path.stat().st_size
+        downloaded = True
 
-    source = track.ImportSource(
-        repo=repo_url,
-        rev=rev,
-        rev_lock=resolved["rev_lock"],
-        path=resolved["path"],
-        remote=resolved["remote_url"],
-    )
-    if "stage" in resolved:
-        source["stage"] = resolved["stage"]
-    pvt_data = track.PvtData(
-        path=data_path.name,
-        hash=resolved["hash"],
-        size=file_size,
+    source = _build_source(repo_url, rev, resolved)
+    pvt_data = _build_pvt_data(
+        path_name=data_path.name,
+        file_size=file_size,
+        resolved=resolved,
         source=source,
     )
 
@@ -524,7 +740,12 @@ async def check_for_update(pvt_data: track.PvtData) -> UpdateCheck:
     )
 
 
-async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -> UpdateResult:
+async def update_import(
+    pvt_path: pathlib.Path,
+    *,
+    new_rev: str | None = None,
+    cache_dir: pathlib.Path | None = None,
+) -> UpdateResult:
     """Update an imported artifact. Re-resolves ref, re-downloads if hash changed."""
     pvt_data = track.read_pvt_file(pvt_path)
     if pvt_data is None:
@@ -536,26 +757,29 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
     rev = new_rev if new_rev is not None else source["rev"]
     old_rev = source["rev_lock"]
 
-    # Re-resolve at new/current rev
     resolved = await resolve_remote_path(source["repo"], source["path"], rev, None)
-
-    downloaded = False
+    is_directory = "manifest" in resolved
     data_path = track.get_data_path(pvt_path)
     need_download = resolved["hash"] != pvt_data["hash"] or not data_path.exists()
 
+    downloaded = False
     file_size = resolved["size"]
     if need_download:
-        remote = remote_storage.S3Remote(resolved["remote_url"])
-        await remote.download_file(resolved["hash"], data_path)
-        actual_hash, _ = cache.hash_file(data_path)
-        if actual_hash != resolved["hash"]:
-            data_path.unlink(missing_ok=True)
-            raise exceptions.RemoteError(
-                f"Hash mismatch: expected {resolved['hash']}, got {actual_hash}"
+        files_cache_dir = _resolve_cache_dir(cache_dir)
+        if is_directory:
+            await _materialize_directory(
+                resolved=resolved, data_path=data_path, cache_dir=files_cache_dir
             )
+        else:
+            await _materialize_file(
+                remote_url=resolved["remote_url"],
+                file_hash=resolved["hash"],
+                dest=data_path,
+                cache_dir=files_cache_dir,
+            )
+            file_size = data_path.stat().st_size
         downloaded = True
-        file_size = data_path.stat().st_size
-    elif data_path.exists():
+    elif data_path.exists() and not is_directory:
         file_size = data_path.stat().st_size
 
     metadata_changed = (
@@ -564,19 +788,11 @@ async def update_import(pvt_path: pathlib.Path, *, new_rev: str | None = None) -
         or rev != source["rev"]
     )
     if metadata_changed:
-        new_source = track.ImportSource(
-            repo=source["repo"],
-            rev=rev,
-            rev_lock=resolved["rev_lock"],
-            path=resolved["path"],
-            remote=resolved["remote_url"],
-        )
-        if "stage" in resolved:
-            new_source["stage"] = resolved["stage"]
-        new_pvt = track.PvtData(
-            path=pvt_data["path"],
-            hash=resolved["hash"],
-            size=file_size,
+        new_source = _build_source(source["repo"], rev, resolved)
+        new_pvt = _build_pvt_data(
+            path_name=pvt_data["path"],
+            file_size=file_size,
+            resolved=resolved,
             source=new_source,
         )
         track.write_pvt_file(pvt_path, new_pvt)
