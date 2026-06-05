@@ -6,7 +6,7 @@ import contextlib
 import json
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
@@ -554,23 +554,13 @@ async def test_rpc_run_invalid_stage_returns_error(
 
 
 @pytest.mark.anyio
-async def test_agent_rpc_source_connection_timeout() -> None:
+async def test_agent_rpc_source_connection_timeout(tmp_path: Path) -> None:
     """AgentRpcSource has timeout protection for idle connections.
 
     Note: This test verifies timeout mechanism exists but uses short timeout
     to avoid slow test execution. Production uses 5 minute timeout.
     """
-    from pathlib import Path
-    from unittest.mock import patch
-
-    import anyio
-
-    from pivot.engine.agent_rpc import AgentRpcSource
-    from pivot.engine.types import InputEvent
-
-    socket_path = Path("/tmp/test_timeout.sock")
-    if socket_path.exists():
-        socket_path.unlink()
+    socket_path = tmp_path / "timeout.sock"
 
     send, recv = anyio.create_memory_object_stream[InputEvent](10)
 
