@@ -412,10 +412,21 @@ async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> No
             oversized_request = json.dumps(
                 {"jsonrpc": "2.0", "method": "run", "id": 1, "data": huge_payload}
             )
-            await conn.send(oversized_request.encode() + b"\n")
 
-            # Should receive error response
-            response_line = await conn.receive(4096)
+            # The payload exceeds the OS socket buffer, so send() can't complete in
+            # one shot: the server reads 1MB, replies, then closes the connection
+            # before we finish writing. Send and receive concurrently so we read the
+            # error response regardless of when the server tears down the write side
+            # (which surfaces as BrokenResourceError on small-buffer platforms).
+            async def _send_oversized() -> None:
+                with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+                    await conn.send(oversized_request.encode() + b"\n")
+
+            response_line = b""
+            async with anyio.create_task_group() as send_tg:
+                send_tg.start_soon(_send_oversized)
+                response_line = await conn.receive(4096)
+
             response = json.loads(response_line.decode())
 
             assert "error" in response, "Should return error for oversized message"

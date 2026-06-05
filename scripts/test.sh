@@ -12,7 +12,10 @@
 # Extra arguments are forwarded to both runs, e.g.:
 #   scripts/test.sh -k rpc
 #   scripts/test.sh -x -m "not slow"
-set -euo pipefail
+set -uo pipefail
 
-uv run pytest packages/pivot/tests -n auto "$@"
-uv run pytest packages/pivot-tui/tests -n auto "$@"
+# Run both suites even if the first has failures, then fail if either did.
+status=0
+uv run pytest packages/pivot/tests -n auto "$@" || status=1
+uv run pytest packages/pivot-tui/tests -n auto "$@" || status=1
+exit "$status"
