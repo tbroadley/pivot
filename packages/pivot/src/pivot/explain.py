@@ -82,7 +82,7 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
-def _state_db_exists(state_dir: pathlib.Path) -> bool:
+def state_db_exists(state_dir: pathlib.Path) -> bool:
     """Return True when the LMDB directory already exists."""
     return (state_dir / "state.lmdb").exists()
 
@@ -99,6 +99,7 @@ def get_stage_explanation(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    state_db: state.StateDB | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -108,6 +109,11 @@ def get_stage_explanation(
             recorded hash for that dep (enabling remote verification).
         tracked_files: Dict of absolute path -> PvtData from .pvt files.
         tracked_trie: Trie of tracked paths for efficient lookup.
+        state_db: A pre-opened readonly StateDB to reuse. When explaining many
+            stages concurrently, the caller must open one shared env and pass it
+            here: LMDB forbids opening the same env twice in a process, and racing
+            opens raise "File exists". When None, this function opens (and closes)
+            its own StateDB if one exists on disk.
     """
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
@@ -141,28 +147,38 @@ def get_stage_explanation(
     # Check generation tracking first (O(1) skip detection) when StateDB exists.
     # explain/status should not create state.lmdb as a side effect.
     # Use verify_files=False since status predicts run behavior after restoration.
-    if _state_db_exists(state_dir):
-        with state.StateDB(state_dir, readonly=True) as state_db:
-            if not force and worker.can_skip_via_generation(
-                stage_name=stage_name,
-                fingerprint=fingerprint,
-                deps=deps,
-                outs_paths=outs_paths,
-                current_params=current_params,
-                lock_data=lock_data,
-                state_db=state_db,
-                verify_files=False,
-            ):
-                return StageExplanation(
-                    stage_name=stage_name,
-                    will_run=False,
-                    is_forced=False,
-                    reason="",
-                    code_changes=[],
-                    param_changes=[],
-                    dep_changes=[],
-                    upstream_stale=[],
-                )
+    def _can_skip(db: state.StateDB) -> bool:
+        return not force and worker.can_skip_via_generation(
+            stage_name=stage_name,
+            fingerprint=fingerprint,
+            deps=deps,
+            outs_paths=outs_paths,
+            current_params=current_params,
+            lock_data=lock_data,
+            state_db=db,
+            verify_files=False,
+        )
+
+    if state_db is not None:
+        # Caller owns the (shared) StateDB; reuse it without opening another env.
+        can_skip = _can_skip(state_db)
+    elif state_db_exists(state_dir):
+        with state.StateDB(state_dir, readonly=True) as own_state_db:
+            can_skip = _can_skip(own_state_db)
+    else:
+        can_skip = False
+
+    if can_skip:
+        return StageExplanation(
+            stage_name=stage_name,
+            will_run=False,
+            is_forced=False,
+            reason="",
+            code_changes=[],
+            param_changes=[],
+            dep_changes=[],
+            upstream_stale=[],
+        )
 
     # Hash dependencies - with optional fallback for missing files
     if allow_missing:
