@@ -885,7 +885,7 @@ async def test_pull_async_with_deps_integration(
     aioboto3_s3_client: S3Client,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
-    """Integration: pull with dependency hashes."""
+    """Integration: pull fetches a dep that is an upstream stage's cached output."""
     out_hash = "ab" + "c" * 14
     dep_hash = "de" + "f" * 14
 
@@ -904,14 +904,20 @@ async def test_pull_async_with_deps_integration(
     cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True)
 
-    lock_data = make_valid_lock_content(
+    stages_dir = state_dir / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    upstream_lock = make_valid_lock_content(
+        outs=[{"path": "in.csv", "hash": dep_hash}],
+        deps=[],
+    )
+    with (stages_dir / "upstream.lock").open("w") as f:
+        yaml.dump(upstream_lock, f)
+    downstream_lock = make_valid_lock_content(
         outs=[{"path": "out.csv", "hash": out_hash}],
         deps=[{"path": "in.csv", "hash": dep_hash}],
     )
-    lock_path = state_dir / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    with (stages_dir / "my_stage.lock").open("w") as f:
+        yaml.dump(downstream_lock, f)
 
     state_db = state_mod.StateDB(state_dir)
 
@@ -922,7 +928,7 @@ async def test_pull_async_with_deps_integration(
         state_db,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("upstream", "my_stage"),
     )
 
     files_dir = cache_dir / "files"
@@ -930,6 +936,54 @@ async def test_pull_async_with_deps_integration(
     dep_path = cache_mod.get_cache_path(files_dir, dep_hash)
     assert out_path.read_bytes() == b"main_file"
     assert dep_path.read_bytes() == b"dependency_file"
+    state_db.close()
+
+
+async def test_pull_async_skips_raw_input_dep(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+    make_valid_lock_content: ValidLockContentFactory,
+) -> None:
+    """Integration (issue #460): a raw-input dep is never fetched, so no failure."""
+    out_hash = "ab" + "c" * 14
+    dep_hash = "de" + "f" * 14
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, out_hash),
+        Body=b"main_file",
+    )
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True)
+
+    lock_data = make_valid_lock_content(
+        outs=[{"path": "out.csv", "hash": out_hash}],
+        deps=[{"path": "spec.yaml", "hash": dep_hash}],
+    )
+    lock_path = state_dir / "stages" / "my_stage.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as f:
+        yaml.dump(lock_data, f)
+
+    state_db = state_mod.StateDB(state_dir)
+
+    result = await transfer._pull_async(
+        cache_dir,
+        state_dir,
+        s3_remote,
+        state_db,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
+    )
+
+    assert result["failed"] == 0, "Raw-input dep must not be fetched (no failed transfer)"
+    files_dir = cache_dir / "files"
+    assert cache_mod.get_cache_path(files_dir, out_hash).read_bytes() == b"main_file"
+    assert not cache_mod.get_cache_path(files_dir, dep_hash).exists()
     state_db.close()
 
 

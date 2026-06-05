@@ -165,6 +165,37 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     return FileHash(hash=track_data["hash"])
 
 
+def _get_cacheable_artifact_hashes(
+    state_dir: pathlib.Path,
+    all_stages: dict[str, RegistryStageInfo],
+    proj_root: pathlib.Path,
+) -> set[str]:
+    """Blob hashes that can exist in the cache/remote: cached stage outputs plus
+    .pvt-tracked artifacts.
+
+    Raw-input dep contents are never written to the cache (only stage outputs
+    are), so ``include_deps`` intersects a stage's dep hashes against this set to
+    avoid fetching blobs that were never pushed.
+    """
+    hashes = set[str]()
+    for stage_name, stage_info in all_stages.items():
+        stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+        try:
+            stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+        except ValueError:
+            continue
+        lock_data = stage_lock.read()
+        if lock_data is None:
+            continue
+        non_cached_paths = {str(out.path) for out in stage_info["outs"] if not out.cache}
+        for out_path, out_hash in lock_data["output_hashes"].items():
+            if out_path not in non_cached_paths:
+                hashes |= _extract_file_hashes_from_hash_info(out_hash)
+    for pvt in track.discover_pvt_files(proj_root).values():
+        hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt))
+    return hashes
+
+
 def get_target_hashes(
     targets: list[str],
     state_dir: pathlib.Path,
@@ -177,6 +208,10 @@ def get_target_hashes(
     proj_root = project.get_project_root()
     hashes = set[str]()
     unresolved = list[str]()
+
+    cacheable: set[str] | None = None
+    if include_deps and all_stages is not None:
+        cacheable = _get_cacheable_artifact_hashes(state_dir, all_stages, proj_root)
 
     for target in targets:
         is_known_stage = all_stages is not None and target in all_stages
@@ -200,11 +235,11 @@ def get_target_hashes(
                         if exclude and exclude(project.to_relative_path(out_path, proj_root)):
                             continue
                         hashes |= _extract_file_hashes_from_hash_info(out_hash)
-                    if include_deps:
+                    if include_deps and cacheable is not None:
                         for dep_path, dep_hash in lock_data["dep_hashes"].items():
                             if exclude and exclude(project.to_relative_path(dep_path, proj_root)):
                                 continue
-                            hashes |= _extract_file_hashes_from_hash_info(dep_hash)
+                            hashes |= _extract_file_hashes_from_hash_info(dep_hash) & cacheable
                     continue
 
         # Strip .pvt suffix if present (CLI normalizes these, but be defensive)
