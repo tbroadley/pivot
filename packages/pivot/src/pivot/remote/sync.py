@@ -59,6 +59,16 @@ def _extract_file_hashes_from_hash_info(hash_info: HashInfo) -> set[str]:
     return {hash_info["hash"]}
 
 
+def _expand_hash_info_paths(hash_info: HashInfo, base_path: str) -> dict[str, str]:
+    """Map each blob hash in hash_info to a human-readable path.
+
+    For directories, each manifest entry maps to ``base_path/relpath``.
+    """
+    if is_dir_hash(hash_info):
+        return {entry["hash"]: f"{base_path}/{entry['relpath']}" for entry in hash_info["manifest"]}
+    return {hash_info["hash"]: base_path}
+
+
 def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set[str]:
     """Extract output hashes from lock files for specific stages.
 
@@ -194,6 +204,41 @@ def _get_cacheable_artifact_hashes(
     for pvt in track.discover_pvt_files(proj_root).values():
         hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt))
     return hashes
+
+
+def build_hash_path_index(
+    state_dir: pathlib.Path,
+    all_stages: dict[str, RegistryStageInfo] | None,
+    proj_root: pathlib.Path,
+) -> dict[str, str]:
+    """Best-effort blob-hash -> project-relative path map for progress display.
+
+    Walks all stage lock outputs + deps and all .pvt files. Intentionally broad (no
+    target/exclude filtering): extra entries are harmless since callers only look up
+    hashes they are actually downloading. Last-writer-wins on hash collisions across
+    paths is fine (content-addressed: same hash == same bytes).
+    """
+    index = dict[str, str]()
+    if all_stages:
+        for stage_name, stage_info in all_stages.items():
+            stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
+            try:
+                stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+            except ValueError:
+                continue
+            lock_data = stage_lock.read()
+            if lock_data is None:
+                continue
+            for out_path, out_hash in lock_data["output_hashes"].items():
+                rel = project.to_relative_path(out_path, proj_root)
+                index.update(_expand_hash_info_paths(out_hash, rel))
+            for dep_path, dep_hash in lock_data["dep_hashes"].items():
+                rel = project.to_relative_path(dep_path, proj_root)
+                index.update(_expand_hash_info_paths(dep_hash, rel))
+    for data_path, pvt in track.discover_pvt_files(proj_root).items():
+        rel = project.to_relative_path(data_path, proj_root)
+        index.update(_expand_hash_info_paths(track.pvt_to_hash_info(pvt), rel))
+    return index
 
 
 def get_target_hashes(
@@ -503,7 +548,18 @@ async def _pull_async(
         cache_path = cache.get_cache_path(files_dir, hash_)
         items.append((hash_, cache_path))
 
-    results = await remote.download_batch(items, concurrency=jobs, callback=callback, readonly=True)
+    download_callback = callback
+    if callback is not None:
+        name_by_hash = build_hash_path_index(state_dir, all_stages, project.get_project_root())
+
+        def _translate(completed: int, total: int, ident: str) -> None:
+            callback(completed, total, name_by_hash.get(ident, ident[:8]))
+
+        download_callback = _translate
+
+    results = await remote.download_batch(
+        items, concurrency=jobs, callback=download_callback, readonly=True
+    )
 
     transferred = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]

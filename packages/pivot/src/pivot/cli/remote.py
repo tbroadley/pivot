@@ -217,7 +217,7 @@ def fetch(
 
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Downloading", quiet=quiet) as progress,
     ):
         result = transfer.pull(
             cache_dir,
@@ -333,7 +333,7 @@ def pull(
     # Step 1: Fetch from remote to cache
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Downloading", quiet=quiet) as progress,
     ):
         fetch_result = transfer.pull(
             cache_dir,

@@ -638,6 +638,10 @@ class S3Remote:
                     nonlocal completed
                     async with semaphore:
                         try:
+                            if callback:
+                                # Start: create the bar and show the active file without
+                                # bumping the count (count tracks files actually fetched).
+                                callback(completed, len(items), hash_)
                             await _atomic_download(
                                 s3,
                                 self._bucket,
@@ -647,7 +651,7 @@ class S3Remote:
                             )
                             completed += 1
                             if callback:
-                                callback(completed, len(items), local_path.name)
+                                callback(completed, len(items), hash_)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))

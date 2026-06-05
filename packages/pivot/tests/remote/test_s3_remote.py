@@ -931,7 +931,7 @@ async def test_download_batch_with_callback(
     tmp_path: pathlib.Path,
     aioboto3_s3_client: S3Client,
 ) -> None:
-    """download_batch calls callback for each completed download."""
+    """download_batch fires callback on start and finish of each download."""
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
 
     for cache_hash, _ in items:
@@ -941,15 +941,23 @@ async def test_download_batch_with_callback(
             Body=b"content",
         )
 
-    callback_values = list[int]()
+    calls = list[tuple[int, int, str]]()
 
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
+    def callback(completed: int, total: int, ident: str) -> None:
+        calls.append((completed, total, ident))
 
     await s3_remote.download_batch(items, concurrency=10, callback=callback)
 
-    assert len(callback_values) == 3
-    assert set(callback_values) == {1, 2, 3}
+    assert len(calls) == len(items) * 2, "callback fires on both start and finish"
+    assert all(total == len(items) for _, total, _ in calls)
+
+    completed_values = [completed for completed, _, _ in calls]
+    assert completed_values[:3] == [0, 0, 0], "starts fire before any finish at this concurrency"
+    assert sorted(completed_values[3:]) == [1, 2, 3], "finishes advance the count"
+
+    assert {ident for _, _, ident in calls} == {h for h, _ in items}, (
+        "callback receives the full blob hash, not the truncated cache filename"
+    )
 
 
 async def test_download_file_default_permissions(
