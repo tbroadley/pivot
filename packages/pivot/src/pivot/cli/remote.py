@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import pathlib
 
 import click
@@ -175,8 +174,9 @@ def fetch(
     """Fetch cached outputs from remote storage to local cache.
 
     TARGETS can be stage names or file paths. If specified, fetches those
-    outputs (and dependencies for stages). Otherwise, fetches all available
-    files from remote.
+    outputs (and dependencies for stages). Otherwise, fetches all files
+    referenced by the current project (stage outputs, dependencies, and tracked
+    files) -- not stale blobs left in the remote.
 
     This command only downloads to the local cache. Use 'pivot pull' to also
     restore files to your workspace, or 'pivot checkout' to restore from cache.
@@ -198,12 +198,9 @@ def fetch(
     targets_list = _get_targets_list(normalized)
 
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
+        needed = transfer.get_needed_hashes(
+            targets_list, state_dir, all_stages, project.get_project_root()
+        )
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
@@ -276,7 +273,9 @@ def pull(
     This matches the behavior of 'git pull' and 'dvc pull'.
 
     TARGETS can be stage names or file paths. If specified, pulls those
-    outputs (and dependencies for stages). Otherwise, pulls all available files.
+    outputs (and dependencies for stages). Otherwise, pulls all files referenced
+    by the current project (stage outputs, dependencies, and tracked files) --
+    not stale blobs left in the remote.
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -306,12 +305,9 @@ def pull(
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
+        needed = transfer.get_needed_hashes(
+            targets_list, state_dir, all_stages, project.get_project_root()
+        )
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local

@@ -9,7 +9,7 @@ from pivot.cli import checkout as checkout_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import sync as transfer
-from pivot.storage import state
+from pivot.storage import state, track
 from pivot.types import TransferSummary
 
 if TYPE_CHECKING:
@@ -254,31 +254,31 @@ def test_fetch_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Fetch dry run without stages lists all remote files."""
+    """Fetch dry run without targets resolves project-referenced files, not the remote."""
+    referenced_hash = "ab" + "c" * 14
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
+        track.write_pvt_file(
+            pathlib.Path("data.csv.pvt"),
+            track.PvtData(path="data.csv", hash=referenced_hash, size=4),
+        )
 
         mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
             return_value=(mock_remote, "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
         result = runner.invoke(cli.cli, ["fetch", "--dry-run"])
 
         assert result.exit_code == 0
-        assert "Would fetch 2 file(s) from 'origin'" in result.output
+        assert "Would fetch 1 file(s) from 'origin'" in result.output
+        mock_remote.list_hashes.assert_not_called()
 
 
 def test_fetch_success(
@@ -429,32 +429,31 @@ def test_pull_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull dry run without stages lists all remote files."""
-
+    """Pull dry run without targets resolves project-referenced files, not the remote."""
+    referenced_hash = "ab" + "c" * 14
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
+        track.write_pvt_file(
+            pathlib.Path("data.csv.pvt"),
+            track.PvtData(path="data.csv", hash=referenced_hash, size=4),
+        )
 
         mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
             return_value=(mock_remote, "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
         result = runner.invoke(cli.cli, ["pull", "--dry-run", "--all"])
 
         assert result.exit_code == 0
-        assert "Would pull 2 file(s) from 'origin'" in result.output
+        assert "Would pull 1 file(s) from 'origin'" in result.output
+        mock_remote.list_hashes.assert_not_called()
 
 
 def test_pull_success(

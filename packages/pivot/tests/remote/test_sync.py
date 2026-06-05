@@ -257,6 +257,116 @@ def test_get_target_hashes_file_target_excludes_noncached(
 
 
 # =============================================================================
+# get_referenced_hashes / get_needed_hashes
+# =============================================================================
+
+
+def _helper_stage_with_outs(*outs: outputs_mod.BaseOut) -> RegistryStageInfo:
+    return RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+        state_dir=None,
+        outs=[outputs_mod.require_expanded(out) for out in outs],
+    )
+
+
+def test_get_referenced_hashes_includes_outputs_and_deps_excludes_noncached(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Referenced hashes include cached outputs and deps, but not cache=False outputs."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    cached_out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    metric_out = outputs_mod.Metric(path=str(set_project_root / "metrics.json"))
+    all_stages = {"my_stage": _helper_stage_with_outs(cached_out, metric_out)}
+
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={str(set_project_root / "in.csv"): FileHash(hash="3333333333333333")},
+        output_hashes={
+            str(set_project_root / "output.csv"): FileHash(hash="1111111111111111"),
+            str(set_project_root / "metrics.json"): FileHash(hash="2222222222222222"),
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    result = sync.get_referenced_hashes(state_dir, all_stages, set_project_root)
+
+    assert result == {"1111111111111111", "3333333333333333"}
+
+
+def test_get_referenced_hashes_includes_tracked_files(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Referenced hashes include .pvt-tracked file hashes."""
+    state_dir = set_project_root / ".pivot"
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="abababababababab", size=10),
+    )
+
+    result = sync.get_referenced_hashes(state_dir, None, set_project_root)
+
+    assert result == {"abababababababab"}
+
+
+def test_get_referenced_hashes_ignores_unregistered_stage_lock(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A lock file for a stage absent from the registry is not pulled (stale state)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(set_project_root / "old.csv"): FileHash(hash="deaddeaddeaddead")},
+    )
+    lock.StageLock("removed_stage", stages_dir).write(lock_data)
+
+    result = sync.get_referenced_hashes(state_dir, {}, set_project_root)
+
+    assert result == set()
+
+
+def test_get_needed_hashes_delegates_to_target_hashes(
+    set_project_root: pathlib.Path,
+) -> None:
+    """With targets, get_needed_hashes resolves only those targets (not all references)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"my_stage": _helper_stage_with_outs(out)}
+    lock.StageLock("my_stage", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={str(set_project_root / "output.csv"): FileHash(hash="1111111111111111")},
+        )
+    )
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="abababababababab", size=10),
+    )
+
+    targeted = sync.get_needed_hashes(["my_stage"], state_dir, all_stages, set_project_root)
+    assert targeted == {"1111111111111111"}, "Targets should not include unrelated tracked files"
+
+    all_refs = sync.get_needed_hashes(None, state_dir, all_stages, set_project_root)
+    assert all_refs == {"1111111111111111", "abababababababab"}
+
+
+# =============================================================================
 # Task 3: Push skips directory cache paths
 # =============================================================================
 

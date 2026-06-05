@@ -228,6 +228,46 @@ def get_target_hashes(
     return hashes
 
 
+def get_referenced_hashes(
+    state_dir: pathlib.Path,
+    all_stages: dict[str, RegistryStageInfo] | None,
+    proj_root: pathlib.Path,
+) -> set[str]:
+    """Cache hashes referenced by the currently checked-out project.
+
+    Includes every registered stage's cached outputs and dependency hashes, plus
+    all .pvt-tracked files. Stale blobs left in the remote that are no longer
+    referenced are intentionally excluded.
+    """
+    _t = metrics.start()
+    hashes = set[str]()
+    if all_stages:
+        hashes |= get_target_hashes(
+            list(all_stages), state_dir, include_deps=True, all_stages=all_stages
+        )
+    for pvt in track.discover_pvt_files(proj_root).values():
+        hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt))
+    metrics.end("sync.get_referenced_hashes", _t)
+    return hashes
+
+
+def get_needed_hashes(
+    targets: list[str] | None,
+    state_dir: pathlib.Path,
+    all_stages: dict[str, RegistryStageInfo] | None,
+    proj_root: pathlib.Path,
+) -> set[str]:
+    """Resolve which cache hashes pull/fetch should download.
+
+    Single source of truth shared by the dry-run and execution paths: explicit
+    targets resolve to their hashes, otherwise the full set of project-referenced
+    hashes (not the entire remote bucket).
+    """
+    if targets:
+        return get_target_hashes(targets, state_dir, include_deps=True, all_stages=all_stages)
+    return get_referenced_hashes(state_dir, all_stages, proj_root)
+
+
 def _check_remote_url(
     state_db: state_mod.StateDB,
     remote_name: str,
@@ -389,12 +429,7 @@ async def _pull_async(
 
     _check_remote_url(state_db, remote_name, remote)
 
-    if targets:
-        needed_hashes = get_target_hashes(
-            targets, state_dir, include_deps=True, all_stages=all_stages
-        )
-    else:
-        needed_hashes = await remote.list_hashes()
+    needed_hashes = get_needed_hashes(targets, state_dir, all_stages, project.get_project_root())
 
     if not needed_hashes:
         metrics.end("sync.pull_async", _t)
