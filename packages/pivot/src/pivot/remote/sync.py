@@ -427,7 +427,7 @@ async def _push_async(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int, int, str], None] | None = None,
+    callback: Callable[[float, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
@@ -470,7 +470,7 @@ async def _push_async(
     if callback is not None:
         name_by_hash = build_hash_path_index(state_dir, all_stages, project.get_project_root())
 
-        def _translate(completed: int, total: int, ident: str) -> None:
+        def _translate(completed: float, total: int, ident: str) -> None:
             callback(completed, total, name_by_hash.get(ident, ident[:8]))
 
         upload_callback = _translate
@@ -502,7 +502,7 @@ def push(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int, int, str], None] | None = None,
+    callback: Callable[[float, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
@@ -531,7 +531,7 @@ async def _pull_async(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int, int, str], None] | None = None,
+    callback: Callable[[float, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     exclude_patterns: list[str] | None = None,
     byte_callback: Callable[[int], None] | None = None,
@@ -567,7 +567,7 @@ async def _pull_async(
     if callback is not None:
         name_by_hash = build_hash_path_index(state_dir, all_stages, project.get_project_root())
 
-        def _translate(completed: int, total: int, ident: str) -> None:
+        def _translate(completed: float, total: int, ident: str) -> None:
             callback(completed, total, name_by_hash.get(ident, ident[:8]))
 
         download_callback = _translate
@@ -603,7 +603,7 @@ def pull(
     remote_name: str,
     targets: list[str] | None = None,
     jobs: int | None = None,
-    callback: Callable[[int, int, str], None] | None = None,
+    callback: Callable[[float, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     exclude_patterns: list[str] | None = None,
     byte_callback: Callable[[int], None] | None = None,

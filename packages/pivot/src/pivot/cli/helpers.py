@@ -152,7 +152,7 @@ class TransferProgress:
         if self._bar is not None:
             self._bar.close()
 
-    def callback(self, completed: int, total: int, filename: str) -> None:
+    def callback(self, completed: float, total: int, filename: str) -> None:
         if not self._show:
             return
         if self._bar is None:
@@ -164,7 +164,9 @@ class TransferProgress:
                 unit="file",
             )
         self._bar.desc = f"{self._action} {filename}"
-        self._bar.update(completed - self._bar.n)
+        # Round so a fractional count renders as e.g. "0.50/1" rather than the raw
+        # float; the percentage column carries the precise progress anyway.
+        self._bar.update(round(completed, 2) - self._bar.n)
 
     def set_bytes(self, bytes_done: int) -> None:
         """Show cumulative bytes transferred and average rate as the bar postfix."""

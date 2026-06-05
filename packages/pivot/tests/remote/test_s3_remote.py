@@ -677,19 +677,59 @@ async def test_upload_batch(
     assert called_bodies == set(contents.values())
 
 
+def test_fractional_progress_fills_within_file() -> None:
+    """_FractionalProgress advances by byte fraction within a file, exact at finish."""
+    seen = list[float]()
+    progress = remote_mod._FractionalProgress(2, lambda c, _t, _i: seen.append(c), None)
+
+    progress.start("a")
+    progress.chunk("a", 50, 100)
+    progress.chunk("a", 50, 100)
+    progress.finish("a")
+    progress.start("b")
+    progress.chunk("b", 25, 100)
+    progress.finish("b")
+
+    assert seen == [0.0, 0.5, 1.0, 1.0, 1.0, 1.25, 2.0]
+
+
+def test_fractional_progress_handles_unknown_size() -> None:
+    """A file with no known total contributes nothing until it finishes (then +1)."""
+    seen = list[float]()
+    progress = remote_mod._FractionalProgress(1, lambda c, _t, _i: seen.append(c), None)
+
+    progress.start("a")
+    progress.chunk("a", 10, 0)
+    progress.finish("a")
+
+    assert seen == [0.0, 0.0, 1.0]
+
+
+def test_fractional_progress_byte_callback_accumulates() -> None:
+    """byte_callback receives the running cumulative byte total across files."""
+    byte_totals = list[int]()
+    progress = remote_mod._FractionalProgress(2, None, byte_totals.append)
+
+    progress.chunk("a", 100, 200)
+    progress.chunk("b", 50, 50)
+    progress.chunk("a", 100, 200)
+
+    assert byte_totals == [100, 150, 250]
+
+
 async def test_upload_batch_with_callback(
     s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """upload_batch fires callback on start and finish of each upload."""
+    """upload_batch reports monotonic fractional progress reaching total files."""
     files = list[tuple[pathlib.Path, str]]()
     for i in range(3):
         f = tmp_path / f"file{i}.txt"
         f.write_text(f"content {i}")
         files.append((f, f"a{i}b2c3d4e5f6789a"))
 
-    calls = list[tuple[int, int, str]]()
+    calls = list[tuple[float, int, str]]()
 
-    def callback(completed: int, total: int, ident: str) -> None:
+    def callback(completed: float, total: int, ident: str) -> None:
         calls.append((completed, total, ident))
 
     mock_client = mocker.AsyncMock()
@@ -698,10 +738,11 @@ async def test_upload_batch_with_callback(
 
     await s3_remote.upload_batch(files, concurrency=1, callback=callback)
 
-    assert len(calls) == len(files) * 2, "callback fires on both start and finish"
+    assert calls, "callback should fire"
     assert all(total == len(files) for _, total, _ in calls)
-    # concurrency=1 makes each file complete before the next starts.
-    assert [completed for completed, _, _ in calls] == [0, 1, 1, 2, 2, 3]
+    completed_values = [completed for completed, _, _ in calls]
+    assert completed_values == sorted(completed_values), "progress is monotonic non-decreasing"
+    assert completed_values[-1] == float(len(files)), "ends at exactly total files"
     assert {ident for _, _, ident in calls} == {h for _, h in files}, (
         "callback receives the full blob hash"
     )
@@ -887,7 +928,7 @@ async def test_download_file_mid_stream_error(
     real_stream_download = remote_mod._stream_download_to_fd
 
     async def _inject_read_failure(
-        response: Any, fd: int, on_chunk: Callable[[int], None] | None = None
+        response: Any, fd: int, on_chunk: Callable[[int, int], None] | None = None
     ) -> None:
         """Wrap stream.read to fail on second call, then delegate to real impl."""
         nonlocal call_count
@@ -936,7 +977,7 @@ async def test_download_file_stream_read_timeout(
     hang_event = asyncio.Event()
 
     async def _inject_hanging_read(
-        response: Any, fd: int, on_chunk: Callable[[int], None] | None = None
+        response: Any, fd: int, on_chunk: Callable[[int, int], None] | None = None
     ) -> None:
         body = response["Body"]
         original_read = body.read
@@ -968,7 +1009,7 @@ async def test_download_batch_with_callback(
     tmp_path: pathlib.Path,
     aioboto3_s3_client: S3Client,
 ) -> None:
-    """download_batch fires callback on start and finish of each download."""
+    """download_batch reports monotonic fractional progress reaching total files."""
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
 
     for cache_hash, _ in items:
@@ -978,20 +1019,18 @@ async def test_download_batch_with_callback(
             Body=b"content",
         )
 
-    calls = list[tuple[int, int, str]]()
+    calls = list[tuple[float, int, str]]()
 
-    def callback(completed: int, total: int, ident: str) -> None:
+    def callback(completed: float, total: int, ident: str) -> None:
         calls.append((completed, total, ident))
 
     await s3_remote.download_batch(items, concurrency=10, callback=callback)
 
-    assert len(calls) == len(items) * 2, "callback fires on both start and finish"
+    assert calls, "callback should fire"
     assert all(total == len(items) for _, total, _ in calls)
-
     completed_values = [completed for completed, _, _ in calls]
-    assert completed_values[:3] == [0, 0, 0], "starts fire before any finish at this concurrency"
-    assert sorted(completed_values[3:]) == [1, 2, 3], "finishes advance the count"
-
+    assert completed_values == sorted(completed_values), "progress is monotonic non-decreasing"
+    assert completed_values[-1] == float(len(items)), "ends at exactly total files"
     assert {ident for _, _, ident in calls} == {h for h, _ in items}, (
         "callback receives the full blob hash, not the truncated cache filename"
     )
