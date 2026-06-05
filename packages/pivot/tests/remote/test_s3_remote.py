@@ -13,6 +13,7 @@ from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable
 
     from pytest_mock import MockerFixture
     from types_aiobotocore_s3 import S3Client
@@ -853,7 +854,9 @@ async def test_download_file_mid_stream_error(
     call_count = 0
     real_stream_download = remote_mod._stream_download_to_fd
 
-    async def _inject_read_failure(response: Any, fd: int) -> None:
+    async def _inject_read_failure(
+        response: Any, fd: int, on_chunk: Callable[[int], None] | None = None
+    ) -> None:
         """Wrap stream.read to fail on second call, then delegate to real impl."""
         nonlocal call_count
         body = response["Body"]
@@ -867,7 +870,7 @@ async def test_download_file_mid_stream_error(
             return await original_read(amt)
 
         body.read = _failing_read
-        await real_stream_download(response, fd)
+        await real_stream_download(response, fd, on_chunk)
 
     monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_read_failure)
 
@@ -900,7 +903,9 @@ async def test_download_file_stream_read_timeout(
     real_stream_download = remote_mod._stream_download_to_fd
     hang_event = asyncio.Event()
 
-    async def _inject_hanging_read(response: Any, fd: int) -> None:
+    async def _inject_hanging_read(
+        response: Any, fd: int, on_chunk: Callable[[int], None] | None = None
+    ) -> None:
         body = response["Body"]
         original_read = body.read
         call_count = 0
@@ -913,7 +918,7 @@ async def test_download_file_stream_read_timeout(
             return await original_read(amt)
 
         body.read = _hanging_read
-        await real_stream_download(response, fd)
+        await real_stream_download(response, fd, on_chunk)
 
     monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_hanging_read)
 
@@ -958,6 +963,34 @@ async def test_download_batch_with_callback(
     assert {ident for _, _, ident in calls} == {h for h, _ in items}, (
         "callback receives the full blob hash, not the truncated cache filename"
     )
+
+
+async def test_download_batch_with_byte_callback(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """download_batch reports cumulative bytes downloaded via byte_callback."""
+    bodies = {f"a{i}b2c3d4e5f6789a": b"x" * (100 * (i + 1)) for i in range(3)}
+    items = [(h, tmp_path / f"dest{i}.txt") for i, h in enumerate(bodies)]
+
+    for cache_hash, body in bodies.items():
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=body,
+        )
+
+    byte_values = list[int]()
+
+    def byte_callback(bytes_done: int) -> None:
+        byte_values.append(bytes_done)
+
+    await s3_remote.download_batch(items, concurrency=10, byte_callback=byte_callback)
+
+    assert byte_values, "byte_callback should fire as chunks stream in"
+    assert byte_values == sorted(byte_values), "cumulative bytes are non-decreasing"
+    assert byte_values[-1] == sum(len(b) for b in bodies.values())
 
 
 async def test_download_file_default_permissions(

@@ -520,6 +520,7 @@ async def _pull_async(
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     exclude_patterns: list[str] | None = None,
+    byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
     _t = metrics.start()
@@ -558,7 +559,11 @@ async def _pull_async(
         download_callback = _translate
 
     results = await remote.download_batch(
-        items, concurrency=jobs, callback=download_callback, readonly=True
+        items,
+        concurrency=jobs,
+        callback=download_callback,
+        readonly=True,
+        byte_callback=byte_callback,
     )
 
     transferred = [r for r in results if r["success"]]
@@ -587,6 +592,7 @@ def pull(
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     exclude_patterns: list[str] | None = None,
+    byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage."""
     return asyncio.run(
@@ -601,6 +607,7 @@ def pull(
             callback,
             all_stages,
             exclude_patterns,
+            byte_callback,
         )
     )
 

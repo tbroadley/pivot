@@ -188,6 +188,7 @@ async def _write_all_async(fd: int, data: bytes) -> None:
 async def _stream_download_to_fd(
     response: GetObjectOutputTypeDef,
     fd: int,
+    on_chunk: Callable[[int], None] | None = None,
 ) -> None:
     """Stream S3 response body to file descriptor in chunks with timeout."""
     stream = response["Body"]
@@ -200,6 +201,8 @@ async def _stream_download_to_fd(
             if not chunk:
                 break
             await _write_all_async(fd, chunk)
+            if on_chunk:
+                on_chunk(len(chunk))
     finally:
         with contextlib.suppress(Exception):
             stream.close()  # pyright: ignore[reportUnknownMemberType]
@@ -212,6 +215,7 @@ async def _atomic_download(
     local_path: Path,
     *,
     readonly: bool = False,
+    on_chunk: Callable[[int], None] | None = None,
 ) -> None:
     """Download S3 object to local path atomically via temp file with streaming.
 
@@ -235,7 +239,7 @@ async def _atomic_download(
                     f"Access denied to {bucket}/{key}. Check AWS credentials."
                 ) from exc
             raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
-        await _stream_download_to_fd(response, fd)
+        await _stream_download_to_fd(response, fd, on_chunk)
         os.close(fd)
         fd = -1  # Mark as closed
         if readonly:
@@ -613,11 +617,14 @@ class S3Remote:
         callback: Callable[[int, int, str], None] | None = None,
         *,
         readonly: bool = False,
+        byte_callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
         """Download multiple files in parallel with atomic writes and streaming.
 
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
+            byte_callback: Called with cumulative bytes downloaded across all files as
+                chunks stream in (for byte/rate progress display).
         """
         _t = metrics.start()
         if not items:
@@ -630,9 +637,18 @@ class S3Remote:
         try:
             semaphore = asyncio.Semaphore(concurrency)
             completed = 0
+            bytes_done = 0
 
             # Single S3 client for all downloads - reuses connection pool
             async with self._session.client("s3", config=_get_s3_config()) as s3:
+
+                def on_chunk(n: int) -> None:
+                    # Safe without a lock: asyncio is single-threaded, so this runs to
+                    # completion between awaits even with concurrent downloads.
+                    nonlocal bytes_done
+                    bytes_done += n
+                    if byte_callback:
+                        byte_callback(bytes_done)
 
                 async def download_one(hash_: str, local_path: Path) -> TransferResult:
                     nonlocal completed
@@ -648,6 +664,7 @@ class S3Remote:
                                 _hash_to_key(self._prefix, hash_),
                                 local_path,
                                 readonly=readonly,
+                                on_chunk=on_chunk if byte_callback else None,
                             )
                             completed += 1
                             if callback:

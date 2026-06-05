@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import json
 import sys
+import time
 from typing import TYPE_CHECKING, Any, cast, override
 
 import click
@@ -17,6 +18,9 @@ if TYPE_CHECKING:
 
 from pivot import exceptions
 from pivot.cli import decorators as cli_decorators
+
+# Captured at import so byte formatting survives tests that monkeypatch ``async_tqdm``.
+_format_sizeof = async_tqdm.format_sizeof
 
 
 class NoPipelineError(exceptions.PivotError):
@@ -122,11 +126,13 @@ class TransferProgress:
     _action: str
     _bar: async_tqdm[Any] | None
     _show: bool
+    _bytes_start: float | None
 
     def __init__(self, action: str, *, quiet: bool = False) -> None:
         self._action = action
         self._bar = None
         self._show = sys.stderr.isatty() and not quiet
+        self._bytes_start = None
 
     def __enter__(self) -> TransferProgress:
         return self
@@ -153,6 +159,20 @@ class TransferProgress:
             )
         self._bar.desc = f"{self._action} {filename}"
         self._bar.update(completed - self._bar.n)
+
+    def set_bytes(self, bytes_done: int) -> None:
+        """Show cumulative bytes transferred and average rate as the bar postfix."""
+        if not self._show or self._bar is None:
+            return
+        if self._bytes_start is None:
+            self._bytes_start = time.monotonic()
+        size = _format_sizeof(bytes_done)
+        elapsed = time.monotonic() - self._bytes_start
+        if elapsed > 0:
+            rate = _format_sizeof(bytes_done / elapsed)
+            self._bar.set_postfix_str(f"{size}B ({rate}B/s)", refresh=False)
+        else:
+            self._bar.set_postfix_str(f"{size}B", refresh=False)
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

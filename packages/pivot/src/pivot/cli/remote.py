@@ -230,6 +230,7 @@ def fetch(
             progress.callback,
             all_stages=all_stages,
             exclude_patterns=list(exclude),
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:
@@ -346,6 +347,7 @@ def pull(
             progress.callback,
             all_stages=all_stages,
             exclude_patterns=list(exclude),
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:
