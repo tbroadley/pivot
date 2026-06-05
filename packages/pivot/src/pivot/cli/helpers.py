@@ -22,6 +22,10 @@ from pivot.cli import decorators as cli_decorators
 # Captured at import so byte formatting survives tests that monkeypatch ``async_tqdm``.
 _format_sizeof = async_tqdm.format_sizeof
 
+# Minimum seconds between byte-postfix repaints (a single large file's file-count bar
+# only advances at start/finish, so set_bytes must repaint itself to look live).
+_BYTES_REFRESH_INTERVAL = 0.1
+
 
 class NoPipelineError(exceptions.PivotError):
     """Raised when no Pipeline is available in context."""
@@ -127,12 +131,14 @@ class TransferProgress:
     _bar: async_tqdm[Any] | None
     _show: bool
     _bytes_start: float | None
+    _bytes_last_refresh: float
 
     def __init__(self, action: str, *, quiet: bool = False) -> None:
         self._action = action
         self._bar = None
         self._show = sys.stderr.isatty() and not quiet
         self._bytes_start = None
+        self._bytes_last_refresh = 0.0
 
     def __enter__(self) -> TransferProgress:
         return self
@@ -164,15 +170,21 @@ class TransferProgress:
         """Show cumulative bytes transferred and average rate as the bar postfix."""
         if not self._show or self._bar is None:
             return
+        now = time.monotonic()
         if self._bytes_start is None:
-            self._bytes_start = time.monotonic()
+            self._bytes_start = now
         size = _format_sizeof(bytes_done)
-        elapsed = time.monotonic() - self._bytes_start
+        elapsed = now - self._bytes_start
         if elapsed > 0:
             rate = _format_sizeof(bytes_done / elapsed)
             self._bar.set_postfix_str(f"{size}B ({rate}B/s)", refresh=False)
         else:
             self._bar.set_postfix_str(f"{size}B", refresh=False)
+        # Repaint on a throttled interval: a single large file only triggers the bar's
+        # own redraw at start/finish, so without this the postfix would never climb.
+        if now - self._bytes_last_refresh >= _BYTES_REFRESH_INTERVAL:
+            self._bytes_last_refresh = now
+            self._bar.refresh()
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

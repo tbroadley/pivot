@@ -238,9 +238,11 @@ def test_transfer_progress_set_bytes_sets_postfix(monkeypatch: pytest.MonkeyPatc
 
     progress = cli_helpers.TransferProgress("Downloading")
     progress.callback(0, 2, "file.txt")  # creates the bar
+    refresh_before = bar.refresh_calls
     progress.set_bytes(2_000_000)
 
     assert "2.00MB" in bar.postfix
+    assert bar.refresh_calls > refresh_before, "set_bytes must repaint so the postfix climbs"
 
 
 def test_transfer_progress_set_bytes_noop_before_bar(monkeypatch: pytest.MonkeyPatch) -> None:
