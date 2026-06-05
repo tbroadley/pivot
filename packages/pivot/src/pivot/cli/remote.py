@@ -163,6 +163,12 @@ def push(
 @click.option(
     "-j", "--jobs", type=click.IntRange(min=1), default=None, help="Parallel download jobs"
 )
+@click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="Exclude referenced paths matching PATTERN (project-relative prefix/exact; repeatable).",
+)
 @click.pass_context
 def fetch(
     ctx: click.Context,
@@ -170,6 +176,7 @@ def fetch(
     remote_name: str | None,
     dry_run: bool,
     jobs: int | None,
+    exclude: tuple[str, ...],
 ) -> None:
     """Fetch cached outputs from remote storage to local cache.
 
@@ -199,7 +206,7 @@ def fetch(
 
     if dry_run:
         needed = transfer.get_needed_hashes(
-            targets_list, state_dir, all_stages, project.get_project_root()
+            targets_list, state_dir, all_stages, project.get_project_root(), list(exclude)
         )
 
         local = transfer.get_local_cache_hashes(cache_dir)
@@ -222,6 +229,7 @@ def fetch(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            exclude_patterns=list(exclude),
         )
 
     if not quiet:
@@ -256,6 +264,12 @@ def fetch(
     default=None,
     help="Checkout mode for restoration (default: project config or hardlink)",
 )
+@click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="Exclude referenced paths matching PATTERN (project-relative prefix/exact; repeatable).",
+)
 @click.pass_context
 def pull(
     ctx: click.Context,
@@ -266,6 +280,7 @@ def pull(
     force: bool,
     only_missing: bool,
     checkout_mode: str | None,
+    exclude: tuple[str, ...],
 ) -> None:
     """Pull cached outputs from remote and restore to workspace.
 
@@ -306,7 +321,7 @@ def pull(
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
         needed = transfer.get_needed_hashes(
-            targets_list, state_dir, all_stages, project.get_project_root()
+            targets_list, state_dir, all_stages, project.get_project_root(), list(exclude)
         )
 
         local = transfer.get_local_cache_hashes(cache_dir)
@@ -330,6 +345,7 @@ def pull(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            exclude_patterns=list(exclude),
         )
 
     if not quiet:
@@ -360,4 +376,5 @@ def pull(
         checkout_mode=checkout_mode,
         force=force,
         only_missing=only_missing,
+        exclude=exclude,
     )

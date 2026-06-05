@@ -281,6 +281,45 @@ def test_fetch_dry_run_all(
         mock_remote.list_hashes.assert_not_called()
 
 
+def test_fetch_dry_run_exclude_drops_matching_paths(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """--exclude removes referenced paths under the pattern from the resolved set."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        track.write_pvt_file(
+            pathlib.Path("public.csv.pvt"),
+            track.PvtData(path="public.csv", hash="ab" + "c" * 14, size=4),
+        )
+        sensitive = pathlib.Path("data/raw/sensitive")
+        sensitive.mkdir(parents=True)
+        track.write_pvt_file(
+            sensitive / "secret.csv.pvt",
+            track.PvtData(path="secret.csv", hash="de" + "f" * 14, size=4),
+        )
+
+        mock_remote = mocker.MagicMock()
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            transfer, "create_remote_from_name", return_value=(mock_remote, "origin")
+        )
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
+
+        excluded = runner.invoke(cli.cli, ["fetch", "--dry-run", "--exclude", "data/raw/sensitive"])
+        assert excluded.exit_code == 0
+        assert "Would fetch 1 file(s) from 'origin'" in excluded.output
+
+        plain = runner.invoke(cli.cli, ["fetch", "--dry-run"])
+        assert plain.exit_code == 0
+        assert "Would fetch 2 file(s) from 'origin'" in plain.output
+
+
 def test_fetch_success(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,

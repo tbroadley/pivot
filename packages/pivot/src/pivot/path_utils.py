@@ -4,6 +4,30 @@ from __future__ import annotations
 
 import os
 import pathlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+
+def make_exclude_matcher(patterns: Sequence[str]) -> Callable[[str], bool] | None:
+    """Build a predicate matching project-relative paths against exclude patterns.
+
+    Directory-prefix + exact match: a path is excluded if it equals a pattern or
+    is nested under it (``pattern + "/"``). For example ``data/raw/sensitive``
+    matches ``data/raw/sensitive`` and ``data/raw/sensitive/scans``, but not
+    ``data/raw/sensitive2``. Leading/trailing slashes are stripped before
+    comparison. Returns None when there are no effective patterns.
+    """
+    norm = [stripped for p in patterns if (stripped := p.strip("/"))]
+    if not norm:
+        return None
+
+    def is_excluded(rel_path: str) -> bool:
+        rel = rel_path.strip("/")
+        return any(rel == p or rel.startswith(p + "/") for p in norm)
+
+    return is_excluded
 
 
 def canonicalize_artifact_path(path: str, base: pathlib.Path) -> str:

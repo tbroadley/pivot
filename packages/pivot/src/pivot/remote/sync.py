@@ -6,7 +6,7 @@ import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, exceptions, metrics, project, registry
+from pivot import config, exceptions, metrics, path_utils, project, registry
 from pivot.remote import config as remote_config
 from pivot.remote import storage as remote_mod
 from pivot.storage import cache, lock, track
@@ -170,6 +170,7 @@ def get_target_hashes(
     state_dir: pathlib.Path,
     include_deps: bool = False,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    exclude: Callable[[str], bool] | None = None,
 ) -> set[str]:
     """Resolve targets (stage names or file paths) to cache hashes."""
     _t = metrics.start()
@@ -194,10 +195,15 @@ def get_target_hashes(
                 lock_data = stage_lock.read()
                 if lock_data is not None:
                     for out_path, out_hash in lock_data["output_hashes"].items():
-                        if out_path not in non_cached_paths:
-                            hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                        if out_path in non_cached_paths:
+                            continue
+                        if exclude and exclude(project.to_relative_path(out_path, proj_root)):
+                            continue
+                        hashes |= _extract_file_hashes_from_hash_info(out_hash)
                     if include_deps:
-                        for dep_hash in lock_data["dep_hashes"].values():
+                        for dep_path, dep_hash in lock_data["dep_hashes"].items():
+                            if exclude and exclude(project.to_relative_path(dep_path, proj_root)):
+                                continue
                             hashes |= _extract_file_hashes_from_hash_info(dep_hash)
                     continue
 
@@ -208,6 +214,9 @@ def get_target_hashes(
 
         abs_path = str(project.normalize_path(target))
         rel_path = project.to_relative_path(abs_path, proj_root)
+
+        if exclude and exclude(rel_path):
+            continue
 
         out_hash = _get_file_hash_from_stages(abs_path, state_dir, all_stages)
         if out_hash is not None:
@@ -232,6 +241,7 @@ def get_referenced_hashes(
     state_dir: pathlib.Path,
     all_stages: dict[str, RegistryStageInfo] | None,
     proj_root: pathlib.Path,
+    exclude: Callable[[str], bool] | None = None,
 ) -> set[str]:
     """Cache hashes referenced by the currently checked-out project.
 
@@ -243,9 +253,11 @@ def get_referenced_hashes(
     hashes = set[str]()
     if all_stages:
         hashes |= get_target_hashes(
-            list(all_stages), state_dir, include_deps=True, all_stages=all_stages
+            list(all_stages), state_dir, include_deps=True, all_stages=all_stages, exclude=exclude
         )
-    for pvt in track.discover_pvt_files(proj_root).values():
+    for data_path, pvt in track.discover_pvt_files(proj_root).items():
+        if exclude and exclude(project.to_relative_path(data_path, proj_root)):
+            continue
         hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt))
     metrics.end("sync.get_referenced_hashes", _t)
     return hashes
@@ -256,16 +268,21 @@ def get_needed_hashes(
     state_dir: pathlib.Path,
     all_stages: dict[str, RegistryStageInfo] | None,
     proj_root: pathlib.Path,
+    exclude_patterns: list[str] | None = None,
 ) -> set[str]:
     """Resolve which cache hashes pull/fetch should download.
 
     Single source of truth shared by the dry-run and execution paths: explicit
     targets resolve to their hashes, otherwise the full set of project-referenced
-    hashes (not the entire remote bucket).
+    hashes (not the entire remote bucket). Paths matching ``exclude_patterns``
+    (project-relative directory prefixes or exact paths) are never accumulated.
     """
+    exclude = path_utils.make_exclude_matcher(exclude_patterns or [])
     if targets:
-        return get_target_hashes(targets, state_dir, include_deps=True, all_stages=all_stages)
-    return get_referenced_hashes(state_dir, all_stages, proj_root)
+        return get_target_hashes(
+            targets, state_dir, include_deps=True, all_stages=all_stages, exclude=exclude
+        )
+    return get_referenced_hashes(state_dir, all_stages, proj_root, exclude=exclude)
 
 
 def _check_remote_url(
@@ -422,6 +439,7 @@ async def _pull_async(
     jobs: int | None = None,
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
     _t = metrics.start()
@@ -429,7 +447,9 @@ async def _pull_async(
 
     _check_remote_url(state_db, remote_name, remote)
 
-    needed_hashes = get_needed_hashes(targets, state_dir, all_stages, project.get_project_root())
+    needed_hashes = get_needed_hashes(
+        targets, state_dir, all_stages, project.get_project_root(), exclude_patterns
+    )
 
     if not needed_hashes:
         metrics.end("sync.pull_async", _t)
@@ -475,6 +495,7 @@ def pull(
     jobs: int | None = None,
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage."""
     return asyncio.run(
@@ -488,6 +509,7 @@ def pull(
             jobs,
             callback,
             all_stages,
+            exclude_patterns,
         )
     )
 

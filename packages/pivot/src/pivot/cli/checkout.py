@@ -360,6 +360,12 @@ def _print_summary(failures: list[str], restored: int, skipped: int, quiet: bool
     is_flag=True,
     help="Only restore files that don't exist on disk (safe for local modifications)",
 )
+@click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="Exclude paths matching PATTERN (project-relative prefix/exact; repeatable).",
+)
 @click.pass_context
 def checkout(
     ctx: click.Context,
@@ -367,6 +373,7 @@ def checkout(
     checkout_mode: str | None,
     force: bool,
     only_missing: bool,
+    exclude: tuple[str, ...],
 ) -> None:
     """Restore tracked files and stage outputs from cache.
 
@@ -401,6 +408,20 @@ def checkout(
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()
     stage_outputs = {} if pipeline is None else _get_stage_output_info()
+
+    # Drop excluded paths so they are neither restored nor reported as missing
+    matcher = path_utils.make_exclude_matcher(exclude)
+    if matcher is not None:
+        tracked_files = {
+            p: v
+            for p, v in tracked_files.items()
+            if not matcher(project.to_relative_path(p, project_root))
+        }
+        stage_outputs = {
+            p: v
+            for p, v in stage_outputs.items()
+            if not matcher(project.to_relative_path(p, project_root))
+        }
 
     state_dir = config.get_state_dir()
 

@@ -645,6 +645,41 @@ def test_checkout_partial_success_some_missing(
         assert "pivot pull" in result.output
 
 
+def test_checkout_exclude_skips_matching_tracked_files(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--exclude drops matching .pvt files so they are not restored or reported missing."""
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+
+        # Public file - in cache, should be restored
+        public = pathlib.Path("public.txt")
+        public.write_text("public content")
+        public_hash = cache.save_to_cache(public, cache_dir)
+        assert public_hash is not None
+        track.write_pvt_file(
+            pathlib.Path("public.txt.pvt"),
+            track.PvtData(path="public.txt", hash=public_hash["hash"], size=14),
+        )
+        public.unlink()
+
+        # Sensitive file - NOT in cache; would normally fail checkout
+        sensitive_dir = pathlib.Path("data/raw/sensitive")
+        sensitive_dir.mkdir(parents=True)
+        track.write_pvt_file(
+            sensitive_dir / "secret.txt.pvt",
+            track.PvtData(path="secret.txt", hash="deadbeef12345678", size=100),
+        )
+
+        result = runner.invoke(cli.cli, ["checkout", "--exclude", "data/raw/sensitive"])
+
+        assert result.exit_code == 0, f"Excluded missing file must not fail: {result.output}"
+        assert public.exists()
+        assert public.read_text() == "public content"
+        assert "Missing" not in result.output
+        assert not (sensitive_dir / "secret.txt").exists()
+
+
 def test_checkout_duplicate_targets_deduplicated(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:

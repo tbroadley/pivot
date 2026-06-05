@@ -513,3 +513,190 @@ def test_get_target_hashes_unresolved_file_target_returns_empty(
     )
 
     assert result == set(), "Unresolved target should return empty set, not crash"
+
+
+# =============================================================================
+# Exclusion via --exclude patterns
+# =============================================================================
+
+
+def test_exclude_drops_dependency_hash(set_project_root: pathlib.Path) -> None:
+    """Excluding a dep path drops its hash (the combine_runs deps leak)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"combine_runs": _helper_stage_with_outs(out)}
+    lock.StageLock("combine_runs", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={
+                str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="5ec5e7"),
+            },
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="0117")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"0117"}, "Excluded dep hash must not be accumulated; output stays"
+
+
+def test_exclude_drops_output_and_tracked_pvt(set_project_root: pathlib.Path) -> None:
+    """Excluding a path drops both stage outputs and standalone .pvt files under it."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    keep_out = outputs_mod.Out(
+        path=str(set_project_root / "public/out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    drop_out = outputs_mod.Out(
+        path=str(set_project_root / "data/raw/sensitive/out.csv"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    all_stages = {"s": _helper_stage_with_outs(keep_out, drop_out)}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                str(set_project_root / "public/out.csv"): FileHash(hash="keep01"),
+                str(set_project_root / "data/raw/sensitive/out.csv"): FileHash(hash="drop01"),
+            },
+        )
+    )
+    track.write_pvt_file(
+        set_project_root / "data/raw/sensitive/transcript_annotation.pvt",
+        track.PvtData(path="transcript_annotation", hash="drop02", size=10),
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"keep01"}, "Excluded output and .pvt hashes must be dropped"
+
+
+def test_exclude_drops_directory_artifact_manifest(set_project_root: pathlib.Path) -> None:
+    """Excluding a directory artifact drops every file hash in its manifest."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    dir_hash = DirHash(
+        hash="treehash",
+        manifest=[
+            DirManifestEntry(relpath="a", hash="dir01", size=1, isexec=False),
+            DirManifestEntry(relpath="b", hash="dir02", size=2, isexec=False),
+        ],
+    )
+    all_stages = {"s": _helper_stage_with_outs()}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "data/raw/sensitive/scans"): dir_hash},
+            output_hashes={},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == set(), "All manifest hashes of an excluded directory must be dropped"
+
+
+def test_exclude_retains_hash_shared_with_nonexcluded_path(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A hash referenced by both an excluded and a non-excluded path is retained."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "public/copy.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"s": _helper_stage_with_outs(out)}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={
+                str(set_project_root / "data/raw/sensitive/orig.csv"): FileHash(hash="dup")
+            },
+            output_hashes={str(set_project_root / "public/copy.csv"): FileHash(hash="dup")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"dup"}, "Shared hash stays because the non-excluded path still references it"
+
+
+def test_exclude_prefix_does_not_match_sibling(set_project_root: pathlib.Path) -> None:
+    """`data/raw/sensitive` excludes nested paths but not a sibling like `sensitive2`."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    all_stages = {"s": _helper_stage_with_outs()}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={
+                str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="nested"),
+                str(set_project_root / "data/raw/sensitive2/x.csv"): FileHash(hash="sibling"),
+            },
+            output_hashes={},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"sibling"}, "Sibling dir sharing a name prefix must not be excluded"
+
+
+def test_exclude_applies_with_explicit_targets(set_project_root: pathlib.Path) -> None:
+    """Exclusion also filters deps when explicit stage targets are given."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"combine_runs": _helper_stage_with_outs(out)}
+    lock.StageLock("combine_runs", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="dep01")},
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="out01")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        ["combine_runs"],
+        state_dir,
+        all_stages,
+        set_project_root,
+        exclude_patterns=["data/raw/sensitive"],
+    )
+
+    assert result == {"out01"}, "Explicit-target pulls must also drop excluded deps"
