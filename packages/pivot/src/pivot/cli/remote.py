@@ -128,7 +128,7 @@ def push(
     # project-level StateDB regardless of --all mode.
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Uploading", quiet=quiet) as progress,
     ):
         result = transfer.push(
             cache_dir,
@@ -140,6 +140,7 @@ def push(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:

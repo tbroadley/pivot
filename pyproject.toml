@@ -81,7 +81,11 @@ exclude_lines = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/pivot/tests", "packages/pivot-tui/tests"]
+# The two suites must run as separate processes (see scripts/test.sh) — a combined
+# collection collides on the duplicated `tests.conftest` module name. testpaths
+# only affects a bare `pytest` (with no path args), which defaults to the pivot
+# suite here; run scripts/test.sh to exercise both, or pass an explicit path.
+testpaths = ["packages/pivot/tests"]
 addopts = [
   "-v",
   "--strict-markers",

@@ -429,6 +429,7 @@ async def _push_async(
     jobs: int | None = None,
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote (async implementation)."""
     _t = metrics.start()
@@ -465,7 +466,18 @@ async def _push_async(
     if skipped_non_file:
         logger.debug("Skipped %d non-file cache entries during push", skipped_non_file)
 
-    results = await remote.upload_batch(items, concurrency=jobs, callback=callback)
+    upload_callback = callback
+    if callback is not None:
+        name_by_hash = build_hash_path_index(state_dir, all_stages, project.get_project_root())
+
+        def _translate(completed: int, total: int, ident: str) -> None:
+            callback(completed, total, name_by_hash.get(ident, ident[:8]))
+
+        upload_callback = _translate
+
+    results = await remote.upload_batch(
+        items, concurrency=jobs, callback=upload_callback, byte_callback=byte_callback
+    )
 
     transferred = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
@@ -492,6 +504,7 @@ def push(
     jobs: int | None = None,
     callback: Callable[[int, int, str], None] | None = None,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    byte_callback: Callable[[int], None] | None = None,
 ) -> TransferSummary:
     """Push cache files to remote storage."""
     return asyncio.run(
@@ -505,6 +518,7 @@ def push(
             jobs,
             callback,
             all_stages,
+            byte_callback,
         )
     )
 

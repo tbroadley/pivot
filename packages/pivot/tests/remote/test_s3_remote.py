@@ -680,17 +680,17 @@ async def test_upload_batch(
 async def test_upload_batch_with_callback(
     s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """upload_batch calls callback for each completed upload."""
+    """upload_batch fires callback on start and finish of each upload."""
     files = list[tuple[pathlib.Path, str]]()
     for i in range(3):
         f = tmp_path / f"file{i}.txt"
         f.write_text(f"content {i}")
         files.append((f, f"a{i}b2c3d4e5f6789a"))
 
-    callback_values = list[int]()
+    calls = list[tuple[int, int, str]]()
 
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
+    def callback(completed: int, total: int, ident: str) -> None:
+        calls.append((completed, total, ident))
 
     mock_client = mocker.AsyncMock()
     mock_client.put_object = mocker.AsyncMock(return_value={})
@@ -698,8 +698,40 @@ async def test_upload_batch_with_callback(
 
     await s3_remote.upload_batch(files, concurrency=1, callback=callback)
 
-    assert len(callback_values) == 3
-    assert set(callback_values) == {1, 2, 3}
+    assert len(calls) == len(files) * 2, "callback fires on both start and finish"
+    assert all(total == len(files) for _, total, _ in calls)
+    # concurrency=1 makes each file complete before the next starts.
+    assert [completed for completed, _, _ in calls] == [0, 1, 1, 2, 2, 3]
+    assert {ident for _, _, ident in calls} == {h for _, h in files}, (
+        "callback receives the full blob hash"
+    )
+
+
+async def test_upload_batch_with_byte_callback(
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """upload_batch reports cumulative bytes uploaded via byte_callback."""
+    files = list[tuple[pathlib.Path, str]]()
+    contents = [b"x" * (100 * (i + 1)) for i in range(3)]
+    for i, body in enumerate(contents):
+        f = tmp_path / f"file{i}.bin"
+        f.write_bytes(body)
+        files.append((f, f"a{i}b2c3d4e5f6789a"))
+
+    byte_values = list[int]()
+
+    def byte_callback(bytes_done: int) -> None:
+        byte_values.append(bytes_done)
+
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock(return_value={})
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    await s3_remote.upload_batch(files, concurrency=1, byte_callback=byte_callback)
+
+    assert byte_values, "byte_callback should fire as chunks stream out"
+    assert byte_values == sorted(byte_values), "cumulative bytes are non-decreasing"
+    assert byte_values[-1] == sum(len(b) for b in contents)
 
 
 async def test_upload_batch_empty() -> None:

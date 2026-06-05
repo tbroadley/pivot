@@ -258,6 +258,7 @@ async def _stream_upload(
     bucket: str,
     key: str,
     local_path: Path,
+    on_chunk: Callable[[int], None] | None = None,
 ) -> None:
     """Upload file to S3 with streaming to avoid memory exhaustion on large files."""
     file_size = local_path.stat().st_size
@@ -265,7 +266,10 @@ async def _stream_upload(
     # For small files (<= 8MB), use simple put_object
     if file_size <= STREAM_CHUNK_SIZE:
         with local_path.open("rb") as f:
-            await s3.put_object(Bucket=bucket, Key=key, Body=f.read())
+            data = f.read()
+        await s3.put_object(Bucket=bucket, Key=key, Body=data)
+        if on_chunk:
+            on_chunk(len(data))
         return
 
     # For large files, use multipart upload
@@ -289,6 +293,8 @@ async def _stream_upload(
                 )
                 parts.append(_MultipartPart(PartNumber=part_number, ETag=part_response["ETag"]))
                 part_number += 1
+                if on_chunk:
+                    on_chunk(len(chunk))
 
         await s3.complete_multipart_upload(
             Bucket=bucket,
@@ -573,8 +579,15 @@ class S3Remote:
         items: list[tuple[Path, str]],
         concurrency: int = DEFAULT_CONCURRENCY,
         callback: Callable[[int, int, str], None] | None = None,
+        *,
+        byte_callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
-        """Upload multiple files in parallel with streaming for large files."""
+        """Upload multiple files in parallel with streaming for large files.
+
+        Args:
+            byte_callback: Called with cumulative bytes uploaded across all files as
+                chunks stream out (for byte/rate progress display).
+        """
         _t = metrics.start()
         if not items:
             metrics.end("storage.upload_batch", _t)
@@ -586,20 +599,37 @@ class S3Remote:
         try:
             semaphore = asyncio.Semaphore(concurrency)
             completed = 0
+            bytes_done = 0
 
             # Single S3 client for all uploads - reuses connection pool
             async with self._session.client("s3", config=_get_s3_config()) as s3:
+
+                def on_chunk(n: int) -> None:
+                    # Safe without a lock: asyncio is single-threaded, so this runs to
+                    # completion between awaits even with concurrent uploads.
+                    nonlocal bytes_done
+                    bytes_done += n
+                    if byte_callback:
+                        byte_callback(bytes_done)
 
                 async def upload_one(local_path: Path, hash_: str) -> TransferResult:
                     nonlocal completed
                     async with semaphore:
                         try:
+                            if callback:
+                                # Start: create the bar and show the active file without
+                                # bumping the count (count tracks files actually uploaded).
+                                callback(completed, len(items), hash_)
                             await _stream_upload(
-                                s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
+                                s3,
+                                self._bucket,
+                                _hash_to_key(self._prefix, hash_),
+                                local_path,
+                                on_chunk=on_chunk if byte_callback else None,
                             )
                             completed += 1
                             if callback:
-                                callback(completed, len(items), local_path.name)
+                                callback(completed, len(items), hash_)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))
