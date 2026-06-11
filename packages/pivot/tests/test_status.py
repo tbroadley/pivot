@@ -213,6 +213,62 @@ def test_pipeline_status_uses_per_stage_state_dir(
     ), f"state_dir not set to custom path; call_args={call_kwargs}"
 
 
+def test_get_pipeline_explanations_raises_aggregated_error_on_failure(
+    set_project_root: pathlib.Path,
+    test_pipeline: pipeline_mod.Pipeline,
+    mocker: MockerFixture,
+) -> None:
+    """Unexpected per-stage failures abort with a PivotError naming every failure."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+    register_test_stage(_helper_stage_b, name="stage_b")
+
+    def _explode(stage_name: str, *_args: object, **_kwargs: object) -> StageExplanation:
+        raise RuntimeError(f"boom-{stage_name}")
+
+    mocker.patch.object(explain, "get_stage_explanation", autospec=True, side_effect=_explode)
+
+    all_stages = test_pipeline.snapshot()
+    with pytest.raises(exceptions.PivotError) as exc_info:
+        status.get_pipeline_explanations(
+            None,
+            single_stage=False,
+            all_stages=all_stages,
+            stage_registry=test_pipeline._registry,
+        )
+
+    message = str(exc_info.value)
+    assert "stage_a" in message
+    assert "stage_b" in message
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_get_pipeline_explanations_preserves_expected_no_lock_state(
+    set_project_root: pathlib.Path,
+    test_pipeline: pipeline_mod.Pipeline,
+) -> None:
+    """A stage that never ran is reported as a normal explanation, not an error."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "input.txt").write_text("data")
+
+    register_test_stage(_helper_stage_a, name="stage_a")
+
+    all_stages = test_pipeline.snapshot()
+    explanations = status.get_pipeline_explanations(
+        None,
+        single_stage=False,
+        all_stages=all_stages,
+        stage_registry=test_pipeline._registry,
+    )
+
+    assert len(explanations) == 1
+    assert explanations[0]["stage_name"] == "stage_a"
+    assert explanations[0]["will_run"] is True
+    assert explanations[0]["reason"] == "No previous run"
+
+
 # =============================================================================
 # Tracked Files Status Tests
 # =============================================================================

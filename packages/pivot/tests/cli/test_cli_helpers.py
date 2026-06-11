@@ -58,6 +58,7 @@ class _HelperDummyBar:
     desc: str
     closed: bool
     refresh_calls: int
+    postfix: str
 
     def __init__(self) -> None:
         self.total = None
@@ -65,12 +66,16 @@ class _HelperDummyBar:
         self.desc = ""
         self.closed = False
         self.refresh_calls = 0
+        self.postfix = ""
 
     def refresh(self) -> None:
         self.refresh_calls += 1
 
     def update(self, n: int) -> None:
         self.n += n
+
+    def set_postfix_str(self, s: str, refresh: bool = True) -> None:
+        self.postfix = s
 
     def close(self) -> None:
         self.closed = True
@@ -223,6 +228,43 @@ def test_transfer_progress_closes_bar(monkeypatch: pytest.MonkeyPatch) -> None:
         progress.callback(1, 1, "file.txt")
 
     assert bar.closed is True
+
+
+def test_transfer_progress_set_bytes_sets_postfix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes renders a human-readable size (and rate) postfix once the bar exists."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.callback(0, 2, "file.txt")  # creates the bar
+    refresh_before = bar.refresh_calls
+    progress.set_bytes(2_000_000)
+
+    assert "2.00MB" in bar.postfix
+    assert bar.refresh_calls > refresh_before, "set_bytes must repaint so the postfix climbs"
+
+
+def test_transfer_progress_set_bytes_noop_before_bar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes does nothing if no bar has been created yet."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.set_bytes(1024)
+
+    assert progress._bar is None
+
+
+def test_transfer_progress_set_bytes_noop_when_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes does nothing in quiet mode."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading", quiet=True)
+    progress.set_bytes(1024)
+
+    assert bar.postfix == ""
 
 
 # =============================================================================

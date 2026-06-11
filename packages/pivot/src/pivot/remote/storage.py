@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import tempfile
-from typing import TYPE_CHECKING, Protocol, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict, final
 
 from pivot import config, exceptions, metrics
 from pivot.remote import config as remote_config
@@ -188,9 +188,15 @@ async def _write_all_async(fd: int, data: bytes) -> None:
 async def _stream_download_to_fd(
     response: GetObjectOutputTypeDef,
     fd: int,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Stream S3 response body to file descriptor in chunks with timeout."""
+    """Stream S3 response body to file descriptor in chunks with timeout.
+
+    ``on_chunk`` is called with (bytes_in_chunk, total_object_bytes) after each
+    write, so callers can show fractional per-file progress.
+    """
     stream = response["Body"]
+    total = response.get("ContentLength", 0)
     try:
         while True:
             chunk: bytes = await asyncio.wait_for(
@@ -200,6 +206,8 @@ async def _stream_download_to_fd(
             if not chunk:
                 break
             await _write_all_async(fd, chunk)
+            if on_chunk:
+                on_chunk(len(chunk), total)
     finally:
         with contextlib.suppress(Exception):
             stream.close()  # pyright: ignore[reportUnknownMemberType]
@@ -212,6 +220,7 @@ async def _atomic_download(
     local_path: Path,
     *,
     readonly: bool = False,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> None:
     """Download S3 object to local path atomically via temp file with streaming.
 
@@ -235,7 +244,7 @@ async def _atomic_download(
                     f"Access denied to {bucket}/{key}. Check AWS credentials."
                 ) from exc
             raise exceptions.RemoteError(f"Failed to download from S3: {exc}") from exc
-        await _stream_download_to_fd(response, fd)
+        await _stream_download_to_fd(response, fd, on_chunk)
         os.close(fd)
         fd = -1  # Mark as closed
         if readonly:
@@ -254,14 +263,22 @@ async def _stream_upload(
     bucket: str,
     key: str,
     local_path: Path,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Upload file to S3 with streaming to avoid memory exhaustion on large files."""
+    """Upload file to S3 with streaming to avoid memory exhaustion on large files.
+
+    ``on_chunk`` is called with (bytes_in_chunk, total_file_bytes) after each part,
+    so callers can show fractional per-file progress.
+    """
     file_size = local_path.stat().st_size
 
     # For small files (<= 8MB), use simple put_object
     if file_size <= STREAM_CHUNK_SIZE:
         with local_path.open("rb") as f:
-            await s3.put_object(Bucket=bucket, Key=key, Body=f.read())
+            data = f.read()
+        await s3.put_object(Bucket=bucket, Key=key, Body=data)
+        if on_chunk:
+            on_chunk(len(data), file_size)
         return
 
     # For large files, use multipart upload
@@ -285,6 +302,8 @@ async def _stream_upload(
                 )
                 parts.append(_MultipartPart(PartNumber=part_number, ETag=part_response["ETag"]))
                 part_number += 1
+                if on_chunk:
+                    on_chunk(len(chunk), file_size)
 
         await s3.complete_multipart_upload(
             Bucket=bucket,
@@ -298,6 +317,57 @@ async def _stream_upload(
         except Exception as abort_error:
             logger.warning(f"Failed to abort multipart upload {upload_id}: {abort_error}")
         raise
+
+
+@final
+class _FractionalProgress:
+    """Accumulates fractional per-file progress for a batch transfer.
+
+    The file-count callback receives ``completed_files + sum(in-flight fractions)``
+    so the bar fills smoothly within each file instead of jumping 0 -> 1. The value
+    is exact (integer) once every file has finished. ``byte_callback`` receives the
+    running cumulative byte total for the rate postfix.
+
+    Safe without locks: asyncio is single-threaded, so each method runs to completion
+    between awaits even while many files transfer concurrently.
+    """
+
+    def __init__(
+        self,
+        total_files: int,
+        callback: Callable[[float, int, str], None] | None,
+        byte_callback: Callable[[int], None] | None,
+    ) -> None:
+        self._total = total_files
+        self._callback = callback
+        self._byte_callback = byte_callback
+        self._completed = 0
+        self._partial = dict[str, float]()
+        self._bytes = 0
+
+    @property
+    def active(self) -> bool:
+        return self._callback is not None or self._byte_callback is not None
+
+    def _emit(self, ident: str) -> None:
+        if self._callback is not None:
+            self._callback(self._completed + sum(self._partial.values()), self._total, ident)
+
+    def start(self, ident: str) -> None:
+        self._emit(ident)
+
+    def chunk(self, ident: str, nbytes: int, total: int) -> None:
+        self._bytes += nbytes
+        if self._byte_callback is not None:
+            self._byte_callback(self._bytes)
+        if total > 0:
+            self._partial[ident] = min(1.0, self._partial.get(ident, 0.0) + nbytes / total)
+        self._emit(ident)
+
+    def finish(self, ident: str) -> None:
+        self._completed += 1
+        self._partial.pop(ident, None)
+        self._emit(ident)
 
 
 class S3Remote:
@@ -568,9 +638,18 @@ class S3Remote:
         self,
         items: list[tuple[Path, str]],
         concurrency: int = DEFAULT_CONCURRENCY,
-        callback: Callable[[int, int, str], None] | None = None,
+        callback: Callable[[float, int, str], None] | None = None,
+        *,
+        byte_callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
-        """Upload multiple files in parallel with streaming for large files."""
+        """Upload multiple files in parallel with streaming for large files.
+
+        Args:
+            callback: Called with (fractional_files_done, total_files, hash) as bytes
+                stream, so the bar fills within each file rather than jumping 0 -> 1.
+            byte_callback: Called with cumulative bytes uploaded across all files as
+                chunks stream out (for byte/rate progress display).
+        """
         _t = metrics.start()
         if not items:
             metrics.end("storage.upload_batch", _t)
@@ -581,21 +660,27 @@ class S3Remote:
 
         try:
             semaphore = asyncio.Semaphore(concurrency)
-            completed = 0
+            progress = _FractionalProgress(len(items), callback, byte_callback)
 
             # Single S3 client for all uploads - reuses connection pool
             async with self._session.client("s3", config=_get_s3_config()) as s3:
 
                 async def upload_one(local_path: Path, hash_: str) -> TransferResult:
-                    nonlocal completed
                     async with semaphore:
                         try:
+                            progress.start(hash_)
                             await _stream_upload(
-                                s3, self._bucket, _hash_to_key(self._prefix, hash_), local_path
+                                s3,
+                                self._bucket,
+                                _hash_to_key(self._prefix, hash_),
+                                local_path,
+                                on_chunk=(
+                                    (lambda n, total: progress.chunk(hash_, n, total))
+                                    if progress.active
+                                    else None
+                                ),
                             )
-                            completed += 1
-                            if callback:
-                                callback(completed, len(items), local_path.name)
+                            progress.finish(hash_)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))
@@ -610,14 +695,19 @@ class S3Remote:
         self,
         items: list[tuple[str, Path]],
         concurrency: int = DEFAULT_CONCURRENCY,
-        callback: Callable[[int, int, str], None] | None = None,
+        callback: Callable[[float, int, str], None] | None = None,
         *,
         readonly: bool = False,
+        byte_callback: Callable[[int], None] | None = None,
     ) -> list[TransferResult]:
         """Download multiple files in parallel with atomic writes and streaming.
 
         Args:
             readonly: If True, set file permissions to 0o444 (for cache files).
+            callback: Called with (fractional_files_done, total_files, hash) as bytes
+                stream, so the bar fills within each file rather than jumping 0 -> 1.
+            byte_callback: Called with cumulative bytes downloaded across all files as
+                chunks stream in (for byte/rate progress display).
         """
         _t = metrics.start()
         if not items:
@@ -629,25 +719,28 @@ class S3Remote:
 
         try:
             semaphore = asyncio.Semaphore(concurrency)
-            completed = 0
+            progress = _FractionalProgress(len(items), callback, byte_callback)
 
             # Single S3 client for all downloads - reuses connection pool
             async with self._session.client("s3", config=_get_s3_config()) as s3:
 
                 async def download_one(hash_: str, local_path: Path) -> TransferResult:
-                    nonlocal completed
                     async with semaphore:
                         try:
+                            progress.start(hash_)
                             await _atomic_download(
                                 s3,
                                 self._bucket,
                                 _hash_to_key(self._prefix, hash_),
                                 local_path,
                                 readonly=readonly,
+                                on_chunk=(
+                                    (lambda n, total: progress.chunk(hash_, n, total))
+                                    if progress.active
+                                    else None
+                                ),
                             )
-                            completed += 1
-                            if callback:
-                                callback(completed, len(items), local_path.name)
+                            progress.finish(hash_)
                             return TransferResult(hash=hash_, success=True)
                         except Exception as e:
                             return TransferResult(hash=hash_, success=False, error=str(e))

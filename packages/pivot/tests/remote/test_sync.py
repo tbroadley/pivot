@@ -54,6 +54,71 @@ def test_extract_file_hashes_from_dir_hash_empty_manifest() -> None:
 
 
 # =============================================================================
+# Unit tests for _expand_hash_info_paths / build_hash_path_index
+# =============================================================================
+
+
+def test_expand_hash_info_paths_file_hash() -> None:
+    """A FileHash maps its blob hash to the given base path."""
+    fh = FileHash(hash="1111111111111111")
+    assert sync._expand_hash_info_paths(fh, "data/out.csv") == {"1111111111111111": "data/out.csv"}
+
+
+def test_expand_hash_info_paths_dir_hash() -> None:
+    """A DirHash maps each manifest entry hash to base_path/relpath (not the tree hash)."""
+    dh = DirHash(
+        hash="aaaaaaaaaaaaaaaa",
+        manifest=[
+            DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=1, isexec=False),
+            DirManifestEntry(relpath="sub/b.csv", hash="2222222222222222", size=1, isexec=False),
+        ],
+    )
+    assert sync._expand_hash_info_paths(dh, "out_dir") == {
+        "1111111111111111": "out_dir/a.csv",
+        "2222222222222222": "out_dir/sub/b.csv",
+    }
+
+
+def test_build_hash_path_index_maps_outputs_deps_and_pvt(set_project_root: pathlib.Path) -> None:
+    """The index maps blob hashes from stage outputs, deps, and .pvt files to rel paths."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir_hash = DirHash(
+        hash="aaaaaaaaaaaaaaaa",
+        manifest=[
+            DirManifestEntry(relpath="part.csv", hash="1111111111111111", size=1, isexec=False)
+        ],
+    )
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={str(set_project_root / "in.csv"): FileHash(hash="3333333333333333")},
+        output_hashes={
+            str(set_project_root / "output.csv"): FileHash(hash="2222222222222222"),
+            str(set_project_root / "out_dir"): out_dir_hash,
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="4444444444444444", size=10),
+    )
+
+    all_stages = {
+        "my_stage": RegistryStageInfo(state_dir=None, outs=[])  # pyright: ignore[reportCallIssue] - partial for test
+    }
+    index = sync.build_hash_path_index(state_dir, all_stages, set_project_root)
+
+    assert index["2222222222222222"] == "output.csv"
+    assert index["3333333333333333"] == "in.csv"
+    assert index["1111111111111111"] == "out_dir/part.csv"
+    assert index["4444444444444444"] == "data.csv"
+
+
+# =============================================================================
 # Integration tests for get_stage_output_hashes / get_stage_dep_hashes
 # =============================================================================
 
