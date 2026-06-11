@@ -1016,9 +1016,11 @@ def hash_dependencies(
 ) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
     """Hash all dependency files and directories.
 
-    Returns (hashes, missing_files, unreadable_files).
+    Returns (hashes, missing_files, unreadable_files, file_hash_entries).
     For directories, includes full manifest with file hashes/sizes for provenance.
     Paths are normalized (symlinks preserved) for portability in lock files.
+    file_hash_entries contains freshly computed hashes (StateDB cache misses),
+    including per-file hashes inside directory deps, for deferred write-back.
     """
     _t = metrics.start()
     hashes = dict[str, HashInfo]()
@@ -1030,20 +1032,11 @@ def hash_dependencies(
         path = pathlib.Path(dep)
         try:
             if path.is_dir():
-                tree_hash, manifest = cache.hash_directory(path, state_db)
+                tree_hash, manifest = cache.hash_directory(path, state_db, file_hash_entries)
                 hashes[normalized] = DirHash(hash=tree_hash, manifest=manifest)
             else:
-                file_hash, file_stat = cache.hash_file(path, state_db)
+                file_hash, _ = cache.hash_file(path, state_db, file_hash_entries)
                 hashes[normalized] = FileHash(hash=file_hash)
-                file_hash_entries.append(
-                    (
-                        normalized,
-                        file_stat.st_mtime_ns,
-                        file_stat.st_size,
-                        file_stat.st_ino,
-                        file_hash,
-                    )
-                )
         except FileNotFoundError:
             missing.append(dep)
         except OSError:

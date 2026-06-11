@@ -1609,9 +1609,19 @@ class Engine:
                 if skip_state_dbs is None:
                     state_db.close()
 
-        dep_hashes, missing, unreadable, _file_hash_entries = await anyio.to_thread.run_sync(
+        dep_hashes, missing, unreadable, file_hash_entries = await anyio.to_thread.run_sync(
             _hash_deps
         )
+
+        if file_hash_entries:
+            # Skip detection hashes against a readonly StateDB; persist freshly
+            # computed hashes here so future skip checks are stat-only.
+            def _write_back_hashes() -> None:
+                with state_mod.StateDB(stage_state_dir) as write_db:
+                    write_db.save_file_hash_entries(file_hash_entries)
+
+            await anyio.to_thread.run_sync(_write_back_hashes)
+
         if missing or unreadable:
             return False
 

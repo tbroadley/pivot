@@ -817,7 +817,7 @@ def test_hash_dependencies_with_existing_files(
     assert len(unreadable) == 0
     assert len(file_hash_entries) == 2
     entry_paths = {entry[0] for entry in file_hash_entries}
-    assert entry_paths == {str(tmp_path / "file1.txt"), str(tmp_path / "file2.txt")}
+    assert entry_paths == {"file1.txt", "file2.txt"}
 
 
 def test_hash_dependencies_with_missing_files() -> None:
@@ -859,7 +859,7 @@ def test_hash_dependencies_with_directory(
     assert manifest[0]["relpath"] == "file.txt"
     assert len(missing) == 0, "No missing dependencies"
     assert len(unreadable) == 0, "No unreadable dependencies"
-    assert file_hash_entries == []
+    assert [entry[0] for entry in file_hash_entries] == ["data_dir/file.txt"]
 
 
 def test_hash_file_produces_consistent_hash(tmp_path: pathlib.Path) -> None:

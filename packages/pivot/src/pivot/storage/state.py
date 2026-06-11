@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import struct
+import threading
 import time
 from typing import TYPE_CHECKING, Self
 
@@ -148,6 +149,60 @@ def _match_cached_hash(value: bytes | None, fs_stat: os.stat_result) -> str | No
     return None
 
 
+class _SharedEnv:
+    """Refcounted LMDB environment shared by all StateDB instances for one path.
+
+    LMDB does not support opening the same environment file twice within a
+    process (the cffi backend raises "already open in this process"; the C
+    extension permits it but POSIX file locks make it unsafe). All StateDB
+    instances for a path therefore share one underlying environment. It is
+    opened read-write when possible so both readonly and writable wrappers can
+    share it; the StateDB wrapper enforces its own readonly flag.
+    """
+
+    env: lmdb.Environment
+    readonly: bool
+    refcount: int
+
+    def __init__(self, env: lmdb.Environment, readonly: bool) -> None:
+        self.env = env
+        self.readonly = readonly
+        self.refcount = 1
+
+
+_shared_envs = dict[str, _SharedEnv]()
+_shared_envs_lock = threading.Lock()
+
+
+def _acquire_env(lmdb_path: pathlib.Path) -> _SharedEnv:
+    key = os.path.realpath(lmdb_path)
+    with _shared_envs_lock:
+        shared = _shared_envs.get(key)
+        if shared is not None:
+            shared.refcount += 1
+            return shared
+        try:
+            env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE)
+            readonly = False
+        except lmdb.Error:
+            # Read-only filesystem or missing write permission
+            env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=True)
+            readonly = True
+        shared = _SharedEnv(env, readonly)
+        _shared_envs[key] = shared
+        return shared
+
+
+def _release_env(lmdb_path: pathlib.Path) -> None:
+    key = os.path.realpath(lmdb_path)
+    with _shared_envs_lock:
+        shared = _shared_envs[key]
+        shared.refcount -= 1
+        if shared.refcount == 0:
+            shared.env.close()
+            del _shared_envs[key]
+
+
 class StateDB:
     """LMDB cache of file hashes and generation counters.
 
@@ -156,11 +211,17 @@ class StateDB:
     file-system locking (MVCC). Workers open in readonly mode to avoid write contention;
     state changes are deferred and applied atomically by the coordinator.
 
+    Within a process, all StateDB instances for the same path share one LMDB
+    environment (see _SharedEnv); instances are cheap wrappers and may be opened
+    concurrently from multiple threads.
+
     Concurrent `pivot run` invocations are safe—each gets its own StateDB instances
     with automatic MVCC snapshot isolation. Readers never block writers and vice versa.
     """
 
     _env: lmdb.Environment
+    _shared: _SharedEnv
+    _lmdb_path: pathlib.Path
     _closed: bool
     _readonly: bool
     _write_timeout: float
@@ -175,11 +236,12 @@ class StateDB:
         lmdb_path = state_dir / "state.lmdb"
         state_dir.mkdir(parents=True, exist_ok=True)
 
-        # LMDB readonly mode can't create database - create empty one first if needed
-        if readonly and not lmdb_path.exists():
-            lmdb.open(str(lmdb_path), map_size=_MAP_SIZE).close()
-
-        self._env = lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, readonly=readonly)
+        self._lmdb_path = lmdb_path
+        self._shared = _acquire_env(lmdb_path)
+        if not readonly and self._shared.readonly:
+            _release_env(lmdb_path)
+            raise StateDBError(f"Cannot open StateDB for writing: {lmdb_path} is not writable")
+        self._env = self._shared.env
         self._closed = False
         self._readonly = readonly
         self._write_timeout = write_timeout
@@ -284,6 +346,29 @@ class StateDB:
                         fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash
                     )
                     txn.put(key, value)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def save_file_hash_entries(self, entries: list[tuple[str, int, int, int, str]]) -> None:
+        """Batch save (path, mtime_ns, size, inode, hash) entries in one transaction.
+
+        Used to write back hashes computed during skip detection / status, where
+        hashing happens against a readonly StateDB and entries are collected for
+        the coordinator to persist.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        if not entries:
+            return
+        try:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
+                for path_str, mtime_ns, size, inode, hash_hex in entries:
+                    key = _make_key_file_hash(pathlib.Path(path_str))
+                    if len(key) > _MAX_KEY_SIZE:
+                        raise PathTooLongError(
+                            f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                        )
+                    txn.put(key, _pack_value(mtime_ns, size, inode, hash_hex))
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
@@ -851,9 +936,9 @@ class StateDB:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def close(self) -> None:
-        """Close the database."""
+        """Close the database (releases the shared environment reference)."""
         if not self._closed:
-            self._env.close()
+            _release_env(self._lmdb_path)
             self._closed = True
 
     def _check_capacity_warning(self) -> None:
