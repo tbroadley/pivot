@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import json
+import shutil
 import sys
 import time
 from typing import TYPE_CHECKING, Any, cast, override
@@ -25,6 +26,33 @@ _format_sizeof = async_tqdm.format_sizeof
 # Minimum seconds between byte-postfix repaints (a single large file's file-count bar
 # only advances at start/finish, so set_bytes must repaint itself to look live).
 _BYTES_REFRESH_INTERVAL = 0.1
+
+# The filename in a transfer bar's prefix is padded/truncated to a fixed width so the
+# bar itself doesn't jump left and right as files of different name lengths stream by.
+_FILENAME_MIN_WIDTH = 12
+_FILENAME_MAX_WIDTH = 60
+# Rough width of everything after the filename on a transfer line: the percentage, the
+# bar, the count/timing block, and the byte/rate postfix, e.g.
+# "  52%|███| 1088.17/2110 [00:51<01:00, 16.96file/s, 983MB (19.6MB/s)]".
+_TRANSFER_BAR_RESERVED = 58
+
+
+def _fit_filename(filename: str, width: int) -> str:
+    """Pad or truncate ``filename`` to exactly ``width`` columns.
+
+    Keeping the prefix a constant width stops the progress bar from jumping. Long
+    paths keep their tail (the actual file name); the head is elided with a leading
+    ellipsis so the most informative part stays visible.
+    """
+    if len(filename) <= width:
+        return filename.ljust(width)
+    return "…" + filename[-(width - 1) :]
+
+
+def _filename_field_width(columns: int, action: str) -> int:
+    """Width to allot the filename, clamped so the bar always has room to render."""
+    available = columns - len(action) - _TRANSFER_BAR_RESERVED
+    return max(_FILENAME_MIN_WIDTH, min(_FILENAME_MAX_WIDTH, available))
 
 
 class NoPipelineError(exceptions.PivotError):
@@ -163,7 +191,8 @@ class TransferProgress:
                 leave=False,
                 unit="file",
             )
-        self._bar.desc = f"{self._action} {filename}"
+        width = _filename_field_width(shutil.get_terminal_size().columns, self._action)
+        self._bar.desc = f"{self._action} {_fit_filename(filename, width)}"
         # Round so a fractional count renders as e.g. "0.50/1" rather than the raw
         # float; the percentage column carries the precise progress anyway.
         self._bar.update(round(completed, 2) - self._bar.n)

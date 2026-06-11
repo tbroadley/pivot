@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import shutil
 import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
@@ -215,7 +217,46 @@ def test_transfer_progress_updates_bar(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert bar.total == 3
     assert bar.n == 2
-    assert bar.desc == "Uploaded another.txt"
+    assert bar.desc.startswith("Uploaded another.txt")
+
+
+def test_fit_filename_pads_short_names() -> None:
+    """Short names are right-padded to exactly the requested width."""
+    assert cli_helpers._fit_filename("a.csv", 10) == "a.csv     "
+
+
+def test_fit_filename_truncates_long_names_keeping_tail() -> None:
+    """Long paths are elided from the head so the file name stays visible."""
+    long_path = "data/raw/scans/scan_id=abc123/measurement_v3.parquet"
+    fitted = cli_helpers._fit_filename(long_path, 20)
+
+    assert len(fitted) == 20
+    assert fitted.startswith("…")
+    assert fitted[1:] == long_path[-19:]
+
+
+def test_filename_field_width_clamped_to_bounds() -> None:
+    """Width tracks terminal size but never escapes the configured bounds."""
+    assert cli_helpers._filename_field_width(40, "Downloading") == cli_helpers._FILENAME_MIN_WIDTH
+    assert (
+        cli_helpers._filename_field_width(10_000, "Downloading") == cli_helpers._FILENAME_MAX_WIDTH
+    )
+
+
+def test_transfer_progress_prefix_width_is_stable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bar prefix is the same width regardless of filename length, so it won't jump."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda: os.terminal_size((120, 24)))
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.callback(0, 2, "short.csv")
+    short_desc = bar.desc
+    progress.callback(1, 2, "data/raw/scans/scan_id=abc123/very_long_measurement_name_v3.parquet")
+    long_desc = bar.desc
+
+    assert len(short_desc) == len(long_desc)
 
 
 def test_transfer_progress_closes_bar(monkeypatch: pytest.MonkeyPatch) -> None:

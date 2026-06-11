@@ -45,11 +45,16 @@ export AWS_CONFIG_FILE="$WORK/aws-config"
 
 _make_big_file() {
   local path="$1"
+  mkdir -p "$(dirname "$path")"
   if command -v mkfile >/dev/null 2>&1; then        # macOS
     mkfile "${SIZE_MB}m" "$path"
   else                                               # linux fallback
     head -c "$((SIZE_MB * 1024 * 1024))" /dev/zero > "$path"
   fi
+  # Stamp a unique marker over the first bytes so otherwise-identical zero blobs
+  # don't content-address to one hash — we want every file to actually transfer so
+  # the bar cycles through all the (differently-named) files.
+  printf '%s\n' "$path" | dd of="$path" conv=notrunc bs=512 count=1 2>/dev/null
 }
 
 setup() {
@@ -87,10 +92,15 @@ print('bucket ready')
   git init -q
   $PIVOT init >/dev/null
   $PIVOT config set remotes.minio "s3://$BUCKET/cache" >/dev/null
+  # Deep paths with long names exercise the filename truncation/padding: the bar
+  # should stay put even as names of very different lengths stream past.
+  local long_dir="data/raw/sensitive/scans/scan_id=EoWGbdLVbSUamBHr6yPL8b"
+  mkdir -p "$long_dir"
   for i in $(seq 1 "$FILES"); do
-    _make_big_file "big$i.bin"
+    _make_big_file "$long_dir/gpt54nano_tm_off_task_v0_vr_$i.parquet"
+    _make_big_file "short$i.bin"
   done
-  $PIVOT track big*.bin
+  $PIVOT track "$long_dir"/*.parquet short*.bin
   echo ">> setup complete"
 }
 
