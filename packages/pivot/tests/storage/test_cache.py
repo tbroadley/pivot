@@ -307,7 +307,9 @@ def test_hash_directory_handles_deleted_file(
     call_count = 0
 
     def hash_file_with_delete(
-        path: pathlib.Path, state_db: state.StateDB | None = None
+        path: pathlib.Path,
+        state_db: state.StateDB | None = None,
+        file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
     ) -> tuple[str, os.stat_result]:
         nonlocal call_count
         call_count += 1

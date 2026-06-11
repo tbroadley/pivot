@@ -287,6 +287,29 @@ class StateDB:
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
+    def save_file_hash_entries(self, entries: list[tuple[str, int, int, int, str]]) -> None:
+        """Batch save (path, mtime_ns, size, inode, hash) entries in one transaction.
+
+        Used to write back hashes computed during skip detection / status, where
+        hashing happens against a readonly StateDB and entries are collected for
+        the coordinator to persist.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        if not entries:
+            return
+        try:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
+                for path_str, mtime_ns, size, inode, hash_hex in entries:
+                    key = _make_key_file_hash(pathlib.Path(path_str))
+                    if len(key) > _MAX_KEY_SIZE:
+                        raise PathTooLongError(
+                            f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
+                        )
+                    txn.put(key, _pack_value(mtime_ns, size, inode, hash_hex))
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
+
     # -------------------------------------------------------------------------
     # AST hash cache for persistent fingerprint caching
     # -------------------------------------------------------------------------

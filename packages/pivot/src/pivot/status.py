@@ -114,6 +114,7 @@ def _get_explanations_in_parallel(
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
     explanations_by_name = dict[str, StageExplanation]()
+    hash_entries_by_state_dir = dict[pathlib.Path, list[tuple[str, int, int, int, str]]]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
@@ -140,10 +141,10 @@ def _get_explanations_in_parallel(
         for future in as_completed(futures):
             stage_name = futures[future]
             try:
-                explanations_by_name[stage_name] = future.result()
+                explanation = future.result()
             except Exception as e:
                 logger.warning(f"Failed to get explanation for {stage_name}: {e}")
-                explanations_by_name[stage_name] = StageExplanation(
+                explanation = StageExplanation(
                     stage_name=stage_name,
                     will_run=True,
                     is_forced=False,
@@ -153,8 +154,36 @@ def _get_explanations_in_parallel(
                     dep_changes=list[DepChange](),
                     upstream_stale=[],
                 )
+            entries = explanation.pop("file_hash_entries", None)
+            if entries:
+                stage_state_dir = registry.get_stage_state_dir(
+                    all_stages[stage_name], default_state_dir
+                )
+                hash_entries_by_state_dir.setdefault(stage_state_dir, []).extend(entries)
+            explanations_by_name[stage_name] = explanation
+
+    _write_back_hash_entries(hash_entries_by_state_dir)
 
     return explanations_by_name
+
+
+def _write_back_hash_entries(
+    hash_entries_by_state_dir: dict[pathlib.Path, list[tuple[str, int, int, int, str]]],
+) -> None:
+    """Persist freshly computed dep hashes so future status/skip checks are stat-only.
+
+    Explanations hash against a readonly StateDB; entries are written back here in
+    one batch per state dir. Skipped when state.lmdb doesn't exist — explain/status
+    must not create it as a side effect.
+    """
+    for state_dir, entries in hash_entries_by_state_dir.items():
+        if not (state_dir / "state.lmdb").exists():
+            continue
+        try:
+            with state_mod.StateDB(state_dir) as state_db:
+                state_db.save_file_hash_entries(entries)
+        except exceptions.PivotDBWriteTimeoutError as e:
+            logger.warning(f"Skipping hash cache write-back for {state_dir}: {e}")
 
 
 def get_pipeline_explanations(

@@ -84,9 +84,14 @@ def atomic_write_file(
 
 
 def hash_file(
-    path: pathlib.Path, state_db: state_mod.StateDB | None = None
+    path: pathlib.Path,
+    state_db: state_mod.StateDB | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> tuple[str, os.stat_result]:
     """Compute xxhash64 of file contents, using state cache if available.
+
+    If file_hash_entries is provided, freshly computed hashes (cache misses) are
+    appended as (path, mtime_ns, size, inode, hash) for deferred StateDB write-back.
 
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
@@ -115,6 +120,11 @@ def hash_file(
                 hasher.update(chunk)
     file_hash = hasher.hexdigest()
     metrics.end("cache.hash_file", _t)
+
+    if file_hash_entries is not None:
+        file_hash_entries.append(
+            (str(path), file_stat.st_mtime_ns, file_stat.st_size, file_stat.st_ino, file_hash)
+        )
 
     if state_db is not None and not state_db.readonly:
         state_db.save(path, file_stat, file_hash)
@@ -177,6 +187,7 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
 def hash_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
     """Compute tree hash of directory, returning hash and manifest.
 
@@ -191,6 +202,8 @@ def hash_directory(
     Args:
         path: Directory to hash
         state_db: Optional StateDB for caching file hashes
+        file_hash_entries: Optional collector for freshly computed per-file hashes
+            (cache misses), for deferred StateDB write-back
     """
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
@@ -204,7 +217,7 @@ def hash_directory(
         try:
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
-            file_hash, _ = hash_file(file_path, state_db)
+            file_hash, _ = hash_file(file_path, state_db, file_hash_entries)
             manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
                 "hash": file_hash,

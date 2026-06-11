@@ -388,6 +388,10 @@ class StageExplanation(TypedDict, total=False):
     param_changes: Required[list[ParamChange]]
     dep_changes: Required[list[DepChange]]
     upstream_stale: Required[list[str]]
+    # Freshly computed dep hashes (StateDB cache misses) collected while
+    # explaining, for write-back. Internal: popped and persisted by
+    # status._get_explanations_in_parallel, never returned to callers.
+    file_hash_entries: list[tuple[str, int, int, int, str]]
 
 
 # =============================================================================
