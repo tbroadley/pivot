@@ -369,10 +369,9 @@ def pull(
     # Import here to avoid circular imports at module level
     from pivot.cli import checkout as checkout_mod
 
-    # Default to only_missing=True to avoid "already exists" errors
-    if not force and not only_missing:
-        only_missing = True
-
+    # Without --force or --only-missing, checkout uses its SAFE default: stale
+    # cache-backed files are updated, but files with untracked local changes are
+    # never clobbered -- checkout errors instead of destroying data.
     ctx.invoke(
         checkout_mod.checkout,
         targets=normalized,

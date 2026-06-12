@@ -514,6 +514,101 @@ def test_checkout_force_overwrites(runner: click.testing.CliRunner, tmp_path: pa
         assert data_file.read_text() == "original content"
 
 
+def test_checkout_updates_stale_cache_backed_file(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Default checkout updates an existing file whose content is a prior cached version.
+
+    Mirrors the post-`git pull` case: the workspace holds an older Pivot-produced
+    version (still in the cache) while the .pvt now points at a newer hash. This is
+    not a local edit, so checkout updates it without --force.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        cache_dir = _setup_test_project()
+
+        data_file = pathlib.Path("data.txt")
+        data_file.write_text("version A")
+        cache.save_to_cache(data_file, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+        data_file.write_text("version B")
+        hash_b = cache.save_to_cache(data_file, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+
+        # .pvt points at B; workspace holds the still-cached old version A
+        track.write_pvt_file(
+            pathlib.Path("data.txt.pvt"),
+            track.PvtData(path="data.txt", hash=hash_b["hash"], size=9),
+        )
+        data_file.write_text("version A")
+
+        result = runner.invoke(cli.cli, ["checkout", "data.txt"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert "Restored" in result.output
+        assert data_file.read_text() == "version B"
+
+
+def test_checkout_errors_on_untracked_change_in_directory_without_clobbering(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """Default checkout refuses to overwrite a tracked dir holding untracked edits.
+
+    Reproduces the data-loss case: a file inside a tracked directory was edited to
+    content Pivot never stored. Checkout must error and leave the edit intact.
+    """
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+
+        data_dir = pathlib.Path("images")
+        data_dir.mkdir()
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "dog.jpg").write_bytes(b"dog image")
+
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        # Replace cat.jpg with content that was never cached (untracked local change)
+        (data_dir / "cat.jpg").unlink()
+        (data_dir / "cat.jpg").write_bytes(b"hand-edited, never stored")
+
+        result = runner.invoke(cli.cli, ["checkout", "images"])
+
+        assert result.exit_code == 1, f"Expected error, got: {result.output}"
+        assert "local changes" in result.output
+        assert "--force" in result.output
+        assert (data_dir / "cat.jpg").read_bytes() == b"hand-edited, never stored", (
+            "Untracked edit must not be clobbered"
+        )
+
+
+def test_checkout_only_missing_preserves_modified_inner_file(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--only-missing fills missing dir entries without overwriting modified ones."""
+    with isolated_pivot_dir(runner, tmp_path):
+        _setup_test_project()
+
+        data_dir = pathlib.Path("images")
+        data_dir.mkdir()
+        (data_dir / "cat.jpg").write_bytes(b"cat image")
+        (data_dir / "dog.jpg").write_bytes(b"dog image")
+
+        result = runner.invoke(cli.cli, ["track", "images"])
+        assert result.exit_code == 0, f"Track failed: {result.output}"
+
+        # Edit one file, delete another
+        (data_dir / "cat.jpg").unlink()
+        (data_dir / "cat.jpg").write_bytes(b"locally edited")
+        (data_dir / "dog.jpg").unlink()
+
+        result = runner.invoke(cli.cli, ["checkout", "--only-missing", "images"])
+
+        assert result.exit_code == 0, f"Failed: {result.output}"
+        assert (data_dir / "cat.jpg").read_bytes() == b"locally edited", (
+            "Modified file must be preserved"
+        )
+        assert (data_dir / "dog.jpg").read_bytes() == b"dog image", "Missing file must be restored"
+
+
 # =============================================================================
 # Error Handling and UX Tests
 # =============================================================================

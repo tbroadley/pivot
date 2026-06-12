@@ -877,16 +877,16 @@ def test_pull_no_pipeline_no_targets_fails_early(
         mock_pull.assert_not_called()
 
 
-def test_pull_defaults_to_only_missing_for_checkout(
+def test_pull_defaults_to_safe_checkout(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull defaults to only_missing=True when neither --force nor --only-missing passed.
+    """Pull passes neither --force nor --only-missing, using checkout's SAFE default.
 
-    When pull invokes checkout without explicit --force or --only-missing flags,
-    it should default to only_missing=True for safety.
+    SAFE updates stale cache-backed files but errors (rather than clobbering) when a
+    file has untracked local changes, so pull never silently loses data.
     """
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
@@ -917,11 +917,11 @@ def test_pull_defaults_to_only_missing_for_checkout(
         result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        # Verify checkout was called with only_missing=True
         mock_checkout.assert_called_once()
         call_kwargs = mock_checkout.call_args.kwargs
-        assert call_kwargs.get("only_missing") is True, (
-            f"Expected only_missing=True, got {call_kwargs}"
+        assert call_kwargs.get("force") is False, f"Expected force=False, got {call_kwargs}"
+        assert call_kwargs.get("only_missing") is False, (
+            f"Expected only_missing=False (SAFE default), got {call_kwargs}"
         )
 
 

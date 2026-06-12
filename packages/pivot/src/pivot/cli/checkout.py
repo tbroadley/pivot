@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import pathlib
 from typing import TYPE_CHECKING, Literal
@@ -11,7 +12,7 @@ from pivot import config, path_utils, project, registry
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -24,9 +25,12 @@ MAX_CONCURRENT_RESTORES = 32
 class CheckoutBehavior(enum.StrEnum):
     """How to handle existing files during checkout."""
 
-    ERROR = "error"  # Error if file already exists (default)
-    SKIP_EXISTING = "skip_existing"  # Skip files that already exist (--only-missing)
-    FORCE = "force"  # Overwrite existing files (--force)
+    SAFE = "safe"  # Update stale (cached) versions; error on untracked changes (default)
+    SKIP_EXISTING = "skip_existing"  # Only restore missing files/dir entries (--only-missing)
+    FORCE = "force"  # Overwrite existing files unconditionally (--force)
+
+
+OnDiskClass = Literal["matches", "known", "untracked"]
 
 
 def _get_stage_output_info() -> dict[str, HashInfo]:
@@ -60,16 +64,38 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
     return result
 
 
-def _on_disk_matches_expected(path: pathlib.Path, expected_hash: HashInfo) -> bool:
-    if is_dir_hash(expected_hash):
-        if not path.is_dir():
-            return False
-        actual_hash, _ = cache.hash_directory(path)
-    else:
-        if not path.is_file():
-            return False
-        actual_hash, _ = cache.hash_file(path)
-    return actual_hash == expected_hash["hash"]
+def _classify_existing(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_db: state.StateDB | None,
+) -> OnDiskClass:
+    """Classify existing on-disk content relative to the target and the cache.
+
+    - "matches": on-disk content already equals the target hash (nothing to do).
+    - "known": content differs from the target but every byte is present in the
+      cache, so it is a prior Pivot-tracked version (e.g. a stale checkout left
+      behind after `git pull`) -- safe to overwrite.
+    - "untracked": content has bytes Pivot never stored (local edits, or extra
+      files inside a directory) -- overwriting would lose data.
+
+    File hashes go through the StateDB cache, so an unchanged file costs an O(1)
+    stat; content is only re-read when its mtime/size/inode changed.
+    """
+    if path.is_dir():
+        tree_hash, manifest = cache.hash_directory(path, state_db)
+        if is_dir_hash(output_hash) and tree_hash == output_hash["hash"]:
+            return "matches"
+        if all(cache.get_cache_path(cache_dir, entry["hash"]).exists() for entry in manifest):
+            return "known"
+        return "untracked"
+
+    file_hash, _ = cache.hash_file(path, state_db)
+    if not is_dir_hash(output_hash) and file_hash == output_hash["hash"]:
+        return "matches"
+    if cache.get_cache_path(cache_dir, file_hash).exists():
+        return "known"
+    return "untracked"
 
 
 def _restore_path_sync(
@@ -79,6 +105,7 @@ def _restore_path_sync(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
+    state_db: state.StateDB | None = None,
 ) -> tuple[RestoreResult, str]:
     """Restore a file or directory from cache (sync version).
 
@@ -87,25 +114,35 @@ def _restore_path_sync(
 
     Raises:
         click.ClickException: For immediate failures (path traversal, unknown target,
-            "already exists" without --force). Cache misses return ("missing", name)
-            instead of raising.
+            untracked local changes without --force). Cache misses return
+            ("missing", name) instead of raising.
     """
     if path.exists():
         match behavior:
-            case CheckoutBehavior.ERROR:
-                if _on_disk_matches_expected(path, output_hash):
-                    return ("skipped", path.name)
-                raise click.ClickException(
-                    f"'{path.name}' already exists with different content. "
-                    + "Use --force to overwrite or --only-missing to skip existing files."
-                )
+            case CheckoutBehavior.SAFE:
+                match _classify_existing(path, output_hash, cache_dir, state_db):
+                    case "matches":
+                        return ("skipped", path.name)
+                    case "untracked":
+                        raise click.ClickException(
+                            f"'{path.name}' already exists with local changes that Pivot "
+                            + "has not stored; refusing to overwrite and lose data. "
+                            + "Use --force to overwrite or --only-missing to skip existing files."
+                        )
+                    case "known":
+                        # Stale but cache-backed version - safe to overwrite below.
+                        pass
             case CheckoutBehavior.SKIP_EXISTING:
-                # For directories with manifests, don't skip - files inside may be missing.
-                # Let restore_from_cache() handle it (does full directory restoration).
-                # DirHash has "manifest" key, FileHash does not.
-                is_directory = is_dir_hash(output_hash)
-                if not is_directory:
+                # Existing file: skip. Existing directory: fill in only the missing
+                # inner files, never overwriting existing (possibly modified) ones.
+                if not is_dir_hash(output_hash) or not path.is_dir():
                     return ("skipped", path.name)
+                restored, unavailable = cache.restore_missing_in_directory(
+                    path, output_hash, cache_dir, checkout_modes
+                )
+                if unavailable:
+                    return ("missing", path.name)
+                return ("restored" if restored else "skipped", path.name)
             case CheckoutBehavior.FORCE:
                 cache.remove_output(path)
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
@@ -131,6 +168,7 @@ async def _checkout_files_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
+    state_db: state.StateDB | None = None,
 ) -> tuple[list[str], int, int]:
     """Restore files in parallel.
 
@@ -160,6 +198,7 @@ async def _checkout_files_async(
                     checkout_modes,
                     behavior,
                     state_dir,
+                    state_db,
                 )
             match result:
                 case "missing":
@@ -262,6 +301,7 @@ async def _checkout_main_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
+    state_db: state.StateDB | None = None,
 ) -> tuple[list[str], int, int]:
     """Main async checkout logic.
 
@@ -278,6 +318,7 @@ async def _checkout_main_async(
             behavior,
             callback,
             state_dir=state_dir,
+            state_db=state_db,
         )
     else:
         # Checkout all tracked files and stage outputs
@@ -303,6 +344,7 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                state_db=state_db,
             )
         )
         t2 = asyncio.create_task(
@@ -313,6 +355,7 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                state_db=state_db,
             )
         )
         (f1, r1, s1), (f2, r2, s2) = await asyncio.gather(t1, t2)
@@ -378,7 +421,9 @@ def checkout(
     """Restore tracked files and stage outputs from cache.
 
     If no targets specified, restores all tracked files and stage outputs.
-    Use --only-missing to skip files that already exist (safe for local modifications).
+    Without --force, existing files with untracked local changes are never
+    overwritten -- checkout errors instead. Use --only-missing to only restore
+    files that don't exist (and fill missing entries inside existing directories).
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -389,7 +434,7 @@ def checkout(
     elif only_missing:
         behavior = CheckoutBehavior.SKIP_EXISTING
     else:
-        behavior = CheckoutBehavior.ERROR
+        behavior = CheckoutBehavior.SAFE
 
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
@@ -425,8 +470,16 @@ def checkout(
 
     state_dir = config.get_state_dir()
 
-    # Run async checkout
-    with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
+    # Run async checkout. SAFE behavior hashes existing files to detect untracked
+    # local changes; a read-only StateDB makes unchanged files an O(1) stat and lets
+    # the parallel restore threads share lock-free MVCC reads.
+    with contextlib.ExitStack() as stack:
+        state_db = (
+            stack.enter_context(state.StateDB(state_dir, readonly=True))
+            if behavior is CheckoutBehavior.SAFE
+            else None
+        )
+        progress = stack.enter_context(cli_helpers.TransferProgress("Restoring", quiet=quiet))
         failures, restored, skipped = asyncio.run(
             _checkout_main_async(
                 targets,
@@ -437,6 +490,7 @@ def checkout(
                 behavior,
                 callback=progress.callback,
                 state_dir=state_dir,
+                state_db=state_db,
             )
         )
 

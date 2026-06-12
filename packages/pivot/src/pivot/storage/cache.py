@@ -754,6 +754,45 @@ def _restore_directory_from_cache(
                 logger.debug(f"Failed to delete lock file: {e}")
 
 
+def restore_missing_in_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+) -> tuple[int, int]:
+    """Restore only the inner files of an existing directory that are missing on disk.
+
+    Additive only: never overwrites or deletes files already present, so it is safe
+    for a workspace that may contain local modifications. Used by --only-missing.
+
+    Returns:
+        Tuple of (restored_count, unavailable_count) where unavailable_count counts
+        missing files whose blob was absent from the cache.
+    """
+    resolved_base = path.resolve()
+    restored = 0
+    unavailable = 0
+    for entry in output_hash["manifest"]:
+        file_path = path / entry["relpath"]
+        # Validate no path traversal (e.g., "../../../etc/passwd")
+        if not file_path.resolve().is_relative_to(resolved_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {entry['relpath']!r}"
+            )
+        if file_path.exists():
+            continue
+        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        if not file_cache_path.exists():
+            unavailable += 1
+            continue
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _checkout_with_fallback(
+            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+        )
+        restored += 1
+    return (restored, unavailable)
+
+
 def remove_output(path: pathlib.Path) -> None:
     """Remove output file or directory before execution."""
     _clear_path(path)
