@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
+import dulwich.objects
+import dulwich.refs
+import dulwich.repo
 
 from conftest import init_git_repo
 from pivot import git, project
@@ -447,3 +451,44 @@ def test_read_matching_blobs_across_revisions_no_git_repo(
 ) -> None:
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     assert list(git.read_matching_blobs_across_revisions(["main"], ".pivot/stages", "*.lock")) == []
+
+
+def test_read_matching_blobs_across_revisions_ignores_submodule_gitlink(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    """A submodule gitlink (mode 0o160000) must not be recursed into and crash the walk.
+
+    ``0o160000 & 0o40000 == 0o40000``, so a bitwise dir test would treat the gitlink as
+    a tree and look up its commit SHA -- absent from the parent object store -- raising
+    KeyError. The whole-tree ``.pvt`` scan (directory="") walks every entry, so a
+    submodule anywhere would abort gc.
+    """
+    repo_path, commit = git_repo
+    stages_dir = repo_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True)
+    (stages_dir / "a.lock").write_text("lockdata")
+    commit("init")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    # Inject a gitlink entry at the root tree pointing at a commit not in this store.
+    repo = dulwich.repo.Repo(str(repo_path))
+    head = repo[repo.head()]
+    assert isinstance(head, dulwich.objects.Commit)
+    root_tree = repo[head.tree]
+    assert isinstance(root_tree, dulwich.objects.Tree)
+    root_tree.add(b"submodule", 0o160000, cast("dulwich.objects.ObjectID", b"0" * 40))
+    repo.object_store.add_object(root_tree)
+    new_commit = dulwich.objects.Commit()
+    new_commit.tree = root_tree.id
+    new_commit.author = new_commit.committer = b"Test <test@test.com>"
+    new_commit.author_time = new_commit.commit_time = 0
+    new_commit.author_timezone = new_commit.commit_timezone = 0
+    new_commit.message = b"add gitlink"
+    new_commit.parents = [head.id]
+    repo.object_store.add_object(new_commit)
+    head_ref = bytes(b"HEAD")
+    repo.refs[cast("dulwich.refs.Ref", head_ref)] = new_commit.id
+
+    blobs = list(git.read_matching_blobs_across_revisions(["HEAD"], "", "*.lock"))
+
+    assert blobs == [b"lockdata"], "gitlink ignored; real lock blob still yielded"

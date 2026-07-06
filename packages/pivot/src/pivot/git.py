@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import stat
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 import dulwich.errors
@@ -61,6 +62,19 @@ def _get_proj_prefix(git_root: Path, proj_root: Path) -> Path | None:
         return proj_root.relative_to(git_root)
     except ValueError:
         return None
+
+
+def get_project_prefix() -> Path | None:
+    """Path of the pivot project root relative to the git root for the current checkout.
+
+    Returns None when the project root coincides with the git root or when not in a
+    git repo. Used to map a worktree's git root to its pivot project subdirectory.
+    """
+    result = _open_repo()
+    if result is None:
+        return None
+    _repo, git_root, proj_root = result
+    return _get_proj_prefix(git_root, proj_root)
 
 
 def _resolve_path(proj_prefix: Path | None, rel_path: str) -> str:
@@ -280,7 +294,9 @@ def _list_tree_files(
 
         full_path = f"{prefix}/{name}" if prefix else name
 
-        if entry.mode & 0o40000:
+        # Exact directory-mode test: a bitwise ``& 0o40000`` also matches submodule
+        # gitlinks (mode 0o160000), whose SHA is a commit not in this object store.
+        if stat.S_ISDIR(entry.mode):
             result.extend(_list_tree_files(repo, entry.sha, full_path, pattern))
         elif fnmatch.fnmatch(name, pattern):
             result.append(full_path)
@@ -326,7 +342,10 @@ def _collect_tree_blob_shas(
             logger.debug(f"Skipping non-UTF8 filename: {entry.path!r}")
             continue
         full_path = f"{prefix}/{name}" if prefix else name
-        if entry.mode & 0o40000:
+        # Exact directory-mode test (see _list_tree_files): a bitwise ``& 0o40000``
+        # also matches submodule gitlinks (mode 0o160000), whose SHA is a commit
+        # absent from this object store, which would crash ``repo[tree_sha]``.
+        if stat.S_ISDIR(entry.mode):
             _collect_tree_blob_shas(repo, entry.sha, full_path, pattern, out)
         elif fnmatch.fnmatch(name, pattern):
             out[full_path] = entry.sha

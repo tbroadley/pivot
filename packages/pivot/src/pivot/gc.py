@@ -17,28 +17,17 @@ import enum
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import yaml
 
-from pivot import git, project
+from pivot import git, project, yaml_config
 from pivot.storage import lock, track
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from pivot.types import DepEntry, OutEntry
-
 logger = logging.getLogger(__name__)
-
-# gc parses hundreds of lock/.pvt files per worktree and revision, so use the
-# libyaml-backed loader (~9x faster than the pure-Python SafeLoader) when
-# available, falling back to the pure-Python loader otherwise.
-_YamlLoader: type[yaml.SafeLoader] | type[yaml.CSafeLoader]
-try:
-    _YamlLoader = yaml.CSafeLoader
-except AttributeError:  # libyaml not built into the PyYAML install
-    _YamlLoader = yaml.SafeLoader
 
 
 class GcScope(enum.Enum):
@@ -48,44 +37,77 @@ class GcScope(enum.Enum):
     ALL = "all"  # every linked worktree + every local branch
 
 
-def _hashes_from_entries(entries: list[DepEntry] | list[OutEntry]) -> set[str]:
-    """Blob hashes for lock deps/outs entries.
+def _hashes_from_manifest(manifest: object) -> set[str]:
+    """Per-file blob hashes from a directory manifest, tolerating malformed shapes.
 
-    For directory entries the blobs are the per-file manifest hashes; the
-    top-level tree hash is not a cached blob. For file entries the blob is the
-    entry hash itself.
+    Lock/.pvt structure validators (``is_lock_data``/``is_pvt_data``) check only
+    top-level keys, so a manifest may be null or hold entries lacking ``hash``.
+    Such entries are skipped rather than crashing the whole gc run -- lock files
+    from mixed code versions must be tolerated.
     """
+    if not isinstance(manifest, list):
+        logger.debug("Skipping non-list manifest in lock/.pvt data")
+        return set[str]()
     hashes = set[str]()
-    for entry in entries:
-        if "manifest" in entry:
-            hashes.update(m["hash"] for m in entry["manifest"])
+    for entry in cast("list[object]", manifest):
+        if not isinstance(entry, dict):
+            logger.debug("Skipping non-dict manifest entry")
+            continue
+        entry_dict = cast("dict[str, object]", entry)
+        if "hash" not in entry_dict:
+            logger.debug("Skipping manifest entry without hash")
+            continue
+        blob_hash = entry_dict["hash"]
+        if isinstance(blob_hash, str):
+            hashes.add(blob_hash)
         else:
-            hashes.add(entry["hash"])
+            logger.debug("Skipping manifest entry with non-str hash")
     return hashes
+
+
+def _hashes_from_ref(ref: object) -> set[str]:
+    """Blob hashes for one lock deps/outs entry or a whole ``.pvt`` document.
+
+    Directory refs contribute their per-file manifest hashes; the top-level tree
+    hash is not a cached blob. File refs contribute the entry hash itself.
+    Malformed refs contribute nothing instead of raising.
+    """
+    if not isinstance(ref, dict):
+        return set[str]()
+    ref_dict = cast("dict[str, object]", ref)
+    if "manifest" in ref_dict:
+        return _hashes_from_manifest(ref_dict["manifest"])
+    if "hash" in ref_dict:
+        blob_hash = ref_dict["hash"]
+        if isinstance(blob_hash, str):
+            return {blob_hash}
+    return set[str]()
 
 
 def _hashes_from_lock_bytes(raw: bytes | str) -> set[str]:
     """Blob hashes referenced by a single lock file's contents."""
     try:
-        data = yaml.load(raw, Loader=_YamlLoader)
+        data = yaml.load(raw, Loader=yaml_config.Loader)
     except yaml.YAMLError:
         return set[str]()
     if not lock.is_lock_data(data):
         return set[str]()
-    return _hashes_from_entries(data["deps"]) | _hashes_from_entries(data["outs"])
+    hashes = set[str]()
+    for entries in (data["deps"], data["outs"]):
+        for entry in entries:
+            hashes |= _hashes_from_ref(entry)
+    return hashes
 
 
 def _hashes_from_pvt_bytes(raw: bytes | str) -> set[str]:
     """Blob hashes referenced by a single ``.pvt`` file's contents."""
     try:
-        data = yaml.load(raw, Loader=_YamlLoader)
+        data = yaml.load(raw, Loader=yaml_config.Loader)
     except yaml.YAMLError:
         return set[str]()
     if not track.is_pvt_data(data):
         return set[str]()
-    if "manifest" in data:
-        return {entry["hash"] for entry in data["manifest"]}
-    return {data["hash"]}
+    return _hashes_from_ref(data)
 
 
 # Directories never worth walking for .pvt files; skipping them (especially a
@@ -157,8 +179,16 @@ def _common_git_dir(git_path: pathlib.Path) -> pathlib.Path | None:
     except OSError:
         return None
     # Linked worktree: ".git" is a file "gitdir: <common>/.git/worktrees/<name>".
+    # With worktree.useRelativePaths (git >= 2.48) the target is relative to the
+    # ".git" file's directory, so anchor it there before resolving.
     _, _, target = content.partition("gitdir:")
-    gitdir = pathlib.Path(target.strip())
+    target = target.strip()
+    if not target:
+        return None
+    gitdir = pathlib.Path(target)
+    if not gitdir.is_absolute():
+        gitdir = git_path.parent / gitdir
+    gitdir = gitdir.resolve()
     return gitdir.parent.parent if gitdir.name else None
 
 
@@ -185,10 +215,15 @@ def worktree_roots(start: pathlib.Path | None = None) -> list[pathlib.Path]:
             if not gitdir_file.is_file():
                 continue
             try:
-                linked_git = pathlib.Path(gitdir_file.read_text().strip())
+                linked_target = gitdir_file.read_text().strip()
             except OSError:
                 continue
-            wt_root = linked_git.parent
+            # With worktree.useRelativePaths the gitdir path is relative to the
+            # "worktrees/<name>/" directory holding this file.
+            linked_git = pathlib.Path(linked_target)
+            if not linked_git.is_absolute():
+                linked_git = gitdir_file.parent / linked_git
+            wt_root = linked_git.resolve().parent
             if wt_root.is_dir():
                 roots.append(wt_root)
             else:
@@ -214,8 +249,13 @@ def collect_referenced_hashes(scope: GcScope) -> set[str]:
     if scope is GcScope.WORKSPACE:
         return referenced_hashes_in_tree(project.get_project_root())
 
+    # worktree_roots() yields git worktree roots, but referenced_hashes_in_tree
+    # expects the pivot project root. When .pivot lives in a subdirectory of the
+    # git repo, apply that same prefix to each worktree root.
+    prefix = git.get_project_prefix()
     hashes = set[str]()
     for root in worktree_roots():
-        hashes |= referenced_hashes_in_tree(root)
+        proj_root = root / prefix if prefix is not None else root
+        hashes |= referenced_hashes_in_tree(proj_root)
     hashes |= referenced_hashes_at_revisions(git.list_local_branches())
     return hashes

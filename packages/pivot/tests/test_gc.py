@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import errno
+import os
+import pathlib
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -9,9 +12,8 @@ from pivot import gc, git, project
 from pivot.storage import cache as cache_mod
 
 if TYPE_CHECKING:
-    import pathlib
-
     import pytest
+    import pytest_mock
 
     from tests.conftest import GitRepo
 
@@ -104,6 +106,48 @@ def test_hashes_from_pvt_bytes_invalid_returns_empty() -> None:
     assert gc._hashes_from_pvt_bytes(yaml.safe_dump({"path": "x"})) == set()
 
 
+def test_hashes_from_lock_bytes_tolerates_malformed_manifest() -> None:
+    null_manifest: dict[str, object] = {"path": "a/", "hash": _hash("t"), "manifest": None}
+    entry_missing_hash: dict[str, object] = {
+        "path": "b/",
+        "hash": _hash("u"),
+        "manifest": [{"relpath": "x", "size": 1, "isexec": False}],
+    }
+    good = _dir_entry("c/", _hash("v"), [_hash("c")])
+    content = _lock_yaml(deps=[], outs=[null_manifest, entry_missing_hash, good])
+
+    assert gc._hashes_from_lock_bytes(content) == {_hash("c")}, (
+        "null manifest and hash-less manifest entries skipped, not crashing"
+    )
+
+
+def test_hashes_from_pvt_bytes_tolerates_malformed_manifest() -> None:
+    null_manifest = yaml.safe_dump({"path": "d", "hash": _hash("b"), "size": 2, "manifest": None})
+    assert gc._hashes_from_pvt_bytes(null_manifest) == set(), "null manifest skipped, not crashing"
+
+    entry_missing_hash = yaml.safe_dump(
+        {
+            "path": "d",
+            "hash": _hash("b"),
+            "size": 2,
+            "manifest": [{"relpath": "x", "size": 1, "isexec": False}],
+        }
+    )
+    assert gc._hashes_from_pvt_bytes(entry_missing_hash) == set(), "hash-less entry skipped"
+
+
+def test_hashes_from_manifest_skips_non_dict_and_non_str_hash() -> None:
+    assert gc._hashes_from_manifest("not-a-list") == set()
+    assert gc._hashes_from_manifest(["not-a-dict", {"relpath": "x", "hash": None}]) == set()
+    assert gc._hashes_from_manifest([{"relpath": "x", "hash": _hash("a")}]) == {_hash("a")}
+
+
+def test_hashes_from_ref_empty_for_non_dict_and_hashless() -> None:
+    assert gc._hashes_from_ref("nope") == set()
+    assert gc._hashes_from_ref({"path": "x"}) == set()
+    assert gc._hashes_from_ref({"path": "x", "hash": None}) == set()
+
+
 # =============================================================================
 # Working-tree scan
 # =============================================================================
@@ -178,6 +222,25 @@ def test_worktree_roots_resolves_from_inside_linked_worktree(git_repo: GitRepo) 
     resolved = {r.resolve() for r in gc.worktree_roots(linked)}
     assert repo_path.resolve() in resolved
     assert linked.resolve() in resolved
+
+
+def test_worktree_roots_resolves_relative_gitdir(tmp_path: pathlib.Path) -> None:
+    # Simulate `git worktree add --relative-paths` (git >= 2.48): the metadata
+    # files hold paths relative to their own directory, not absolute.
+    main = tmp_path / "main"
+    foo_meta = main / ".git" / "worktrees" / "foo"
+    foo_meta.mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    # wt/.git file: relative gitdir pointing at the shared worktree metadata dir.
+    (wt / ".git").write_text(f"gitdir: {os.path.relpath(foo_meta, wt)}\n")
+    # worktrees/foo/gitdir: relative path back to the linked worktree's .git file.
+    (foo_meta / "gitdir").write_text(f"{os.path.relpath(wt / '.git', foo_meta)}\n")
+
+    resolved = {r.resolve() for r in gc.worktree_roots(wt)}
+    assert main.resolve() in resolved, "relative .git-file gitdir resolved"
+    assert wt.resolve() in resolved, "relative worktrees/<name>/gitdir resolved"
 
 
 def test_worktree_roots_skips_stale_worktree(git_repo: GitRepo) -> None:
@@ -283,6 +346,23 @@ def test_collect_referenced_hashes_workspace_vs_all(
     assert {_hash("a"), _hash("b")} <= all_scope
 
 
+def test_collect_referenced_hashes_all_with_pivot_in_subdir(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path, commit = git_repo
+    subdir = repo_path / "proj"
+    subdir.mkdir()
+    (repo_path / "f").write_text("x")
+    commit("init")
+    monkeypatch.setattr(project, "_project_root_cache", subdir)
+
+    # Uncommitted lock in the pivot project subdir (the case gc must not miss).
+    _write_lock(subdir / ".pivot" / "stages", "s", _lock_yaml([], [_file_entry("out", _hash("a"))]))
+
+    all_scope = gc.collect_referenced_hashes(gc.GcScope.ALL)
+    assert _hash("a") in all_scope, "uncommitted lock under .pivot subdir must be collected"
+
+
 # =============================================================================
 # Cache blob helpers
 # =============================================================================
@@ -295,11 +375,10 @@ def test_sum_blob_sizes(tmp_path: pathlib.Path) -> None:
     assert cache_mod.sum_blob_sizes(tmp_path, {_hash("a"), _hash("f")}) == 5, "missing counts as 0"
 
 
-def test_remove_cache_blobs_frees_and_prunes_empty_prefix(tmp_path: pathlib.Path) -> None:
+def test_remove_cache_blobs_removes_and_prunes_empty_prefix(tmp_path: pathlib.Path) -> None:
     blob = _make_blob(tmp_path, _hash("a"), b"1234")
     prefix_dir = blob.parent
-    removed, freed = cache_mod.remove_cache_blobs(tmp_path, {_hash("a")})
-    assert (removed, freed) == (1, 4)
+    assert cache_mod.remove_cache_blobs(tmp_path, {_hash("a")}) == 1
     assert not blob.exists()
     assert not prefix_dir.exists(), "emptied prefix directory is pruned"
 
@@ -309,10 +388,27 @@ def test_remove_cache_blobs_keeps_nonempty_prefix(tmp_path: pathlib.Path) -> Non
     keep = "aa" + "b" * (cache_mod.XXHASH64_HEX_LENGTH - 2)
     _make_blob(tmp_path, _hash("a"))
     kept_blob = _make_blob(tmp_path, keep)
-    removed, _freed = cache_mod.remove_cache_blobs(tmp_path, {_hash("a")})
-    assert removed == 1
+    assert cache_mod.remove_cache_blobs(tmp_path, {_hash("a")}) == 1
     assert kept_blob.exists(), "prefix retained because another blob remains"
 
 
 def test_remove_cache_blobs_missing_hash_is_noop(tmp_path: pathlib.Path) -> None:
-    assert cache_mod.remove_cache_blobs(tmp_path, {_hash("f")}) == (0, 0)
+    assert cache_mod.remove_cache_blobs(tmp_path, {_hash("f")}) == 0
+
+
+def test_remove_cache_blobs_skips_unstattable_entry(
+    tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture
+) -> None:
+    good = _make_blob(tmp_path, _hash("a"), b"1234")
+    real_stat = pathlib.Path.stat
+
+    def fake_stat(self: pathlib.Path, *args: object, **kwargs: object) -> object:
+        if self.name == _hash("b")[2:]:
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+        return real_stat(self, *args, **kwargs)
+
+    mocker.patch.object(pathlib.Path, "stat", autospec=True, side_effect=fake_stat)
+
+    removed = cache_mod.remove_cache_blobs(tmp_path, [_hash("b"), _hash("a")])
+    assert removed == 1, "bad entry skipped, good entry still removed"
+    assert not good.exists()

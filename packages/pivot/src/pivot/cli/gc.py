@@ -104,6 +104,6 @@ def gc(
             abort=True,
         )
 
-    removed, freed_bytes = cache_mod.remove_cache_blobs(cache_dir, removable)
+    removed = cache_mod.remove_cache_blobs(cache_dir, removable)
     if not quiet:
-        click.echo(f"Removed {removed} blob(s), freed {_format_sizeof(freed_bytes)}B.")
+        click.echo(f"Removed {removed} blob(s), freed {_format_sizeof(freed)}B.")

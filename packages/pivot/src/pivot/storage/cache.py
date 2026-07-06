@@ -805,23 +805,26 @@ def sum_blob_sizes(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
     return total
 
 
-def remove_cache_blobs(cache_dir: pathlib.Path, hashes: Iterable[str]) -> tuple[int, int]:
-    """Delete the given cache blobs. Returns (removed_count, freed_bytes).
+def remove_cache_blobs(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
+    """Delete the given cache blobs and return the number actually removed.
+
+    Freed byte totals are computed by the caller via ``sum_blob_sizes`` (for the
+    dry-run/confirmation message), so this avoids a second full stat pass.
 
     Blob files are read-only (0o444); deletion only needs a writable parent
     directory, which _clear_path arranges without ever chmod-ing the blob itself
     (blobs may be hardlinked to checked-out workspace files). Emptied prefix
-    directories are pruned.
+    directories are pruned. A blob that cannot be stat'd (missing, or any other
+    OSError) is skipped so one bad entry never leaves the cache half-collected.
     """
     files_dir = cache_dir / "files"
     removed = 0
-    freed = 0
     prefixes = set[pathlib.Path]()
     for file_hash in hashes:
         cache_path = get_cache_path(files_dir, file_hash)
         try:
-            freed += cache_path.stat().st_size
-        except FileNotFoundError:
+            cache_path.stat()
+        except OSError:
             continue
         _clear_path(cache_path)
         removed += 1
@@ -829,7 +832,7 @@ def remove_cache_blobs(cache_dir: pathlib.Path, hashes: Iterable[str]) -> tuple[
     for prefix in prefixes:
         with contextlib.suppress(OSError):
             prefix.rmdir()  # only succeeds when empty
-    return removed, freed
+    return removed
 
 
 def remove_output(path: pathlib.Path) -> None:
