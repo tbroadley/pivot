@@ -102,17 +102,32 @@ class _MultipartPart(TypedDict):
     ETag: str
 
 
-def _get_s3_config() -> AioConfig:
-    """Get standard S3 client config with retries and timeouts (cached)."""
+def _get_s3_config(concurrency: int | None = None) -> AioConfig:
+    """Get standard S3 client config with retries and timeouts.
+
+    botocore defaults max_pool_connections to 10, which silently throttles
+    concurrent transfers: even with a larger asyncio semaphore, only 10
+    connections are in flight, so many-small-file transfers stall on connection
+    contention. Size the pool to the transfer concurrency so the semaphore is
+    the real limit.
+
+    ``concurrency`` is the batch's effective job count (from ``--jobs`` or
+    ``remote.jobs``); pass it so the pool tracks the CLI value, not just config.
+    The concurrency-less config (single-file ops) is cached to avoid re-parsing
+    config on every call.
+    """
+    from aiobotocore.config import AioConfig
+
+    if concurrency is not None:
+        return AioConfig(
+            retries={"max_attempts": config.get_remote_retries()},
+            connect_timeout=config.get_remote_connect_timeout(),
+            read_timeout=STREAM_READ_TIMEOUT,
+            max_pool_connections=max(concurrency, DEFAULT_CONCURRENCY),
+        )
+
     global _cached_s3_config
     if _cached_s3_config is None:
-        from aiobotocore.config import AioConfig
-
-        # botocore defaults max_pool_connections to 10, which silently throttles
-        # concurrent transfers below remote.jobs: even with a larger asyncio
-        # semaphore, only 10 connections are in flight, so many-small-file
-        # transfers stall on connection contention. Size the pool to the transfer
-        # concurrency so the semaphore is the real limit.
         _cached_s3_config = AioConfig(
             retries={"max_attempts": config.get_remote_retries()},
             connect_timeout=config.get_remote_connect_timeout(),
@@ -457,7 +472,7 @@ class S3Remote:
 
         try:
             # Single S3 client for all operations - reuses connection pool
-            async with self._session.client("s3", config=_get_s3_config()) as s3:
+            async with self._session.client("s3", config=_get_s3_config(concurrency)) as s3:
                 # For large batches, LIST by prefix is more efficient than HEAD per hash
                 if len(hashes) >= BULK_EXISTS_LIST_THRESHOLD:
                     output = await self._bulk_exists_via_list(s3, hashes, concurrency)
@@ -669,7 +684,7 @@ class S3Remote:
             progress = _FractionalProgress(len(items), callback, byte_callback)
 
             # Single S3 client for all uploads - reuses connection pool
-            async with self._session.client("s3", config=_get_s3_config()) as s3:
+            async with self._session.client("s3", config=_get_s3_config(concurrency)) as s3:
 
                 async def upload_one(local_path: Path, hash_: str) -> TransferResult:
                     async with semaphore:
@@ -728,7 +743,7 @@ class S3Remote:
             progress = _FractionalProgress(len(items), callback, byte_callback)
 
             # Single S3 client for all downloads - reuses connection pool
-            async with self._session.client("s3", config=_get_s3_config()) as s3:
+            async with self._session.client("s3", config=_get_s3_config(concurrency)) as s3:
 
                 async def download_one(hash_: str, local_path: Path) -> TransferResult:
                     async with semaphore:

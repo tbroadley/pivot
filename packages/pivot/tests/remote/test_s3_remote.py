@@ -1258,3 +1258,28 @@ def test_get_s3_config_pool_floors_at_default_concurrency(mocker: MockerFixture)
         assert cfg.max_pool_connections == remote_mod.DEFAULT_CONCURRENCY  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
     finally:
         remote_mod._cached_s3_config = None
+
+
+def test_get_s3_config_pool_tracks_explicit_concurrency(mocker: MockerFixture) -> None:
+    """An explicit concurrency (e.g. from --jobs) sizes the pool, ignoring config."""
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    cfg = remote_mod._get_s3_config(100)
+    assert cfg.max_pool_connections == 100  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+
+
+def test_get_s3_config_explicit_concurrency_floors_at_default(mocker: MockerFixture) -> None:
+    """A small explicit concurrency still floors at DEFAULT_CONCURRENCY."""
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    cfg = remote_mod._get_s3_config(1)
+    assert cfg.max_pool_connections == remote_mod.DEFAULT_CONCURRENCY  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+
+
+def test_get_s3_config_explicit_concurrency_is_not_cached(mocker: MockerFixture) -> None:
+    """Passing concurrency returns a fresh config and never populates the cache."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    try:
+        remote_mod._get_s3_config(100)
+        assert remote_mod._cached_s3_config is None
+    finally:
+        remote_mod._cached_s3_config = None
