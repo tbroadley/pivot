@@ -486,7 +486,7 @@ def test_read_matching_blobs_across_revisions_ignores_submodule_gitlink(
     new_commit.message = b"add gitlink"
     new_commit.parents = [head.id]
     repo.object_store.add_object(new_commit)
-    head_ref = bytes(b"HEAD")
+    head_ref = b"HEAD"
     repo.refs[cast("dulwich.refs.Ref", head_ref)] = new_commit.id
 
     blobs = list(git.read_matching_blobs_across_revisions(["HEAD"], "", "*.lock"))
