@@ -97,6 +97,11 @@ def _helper_make_dummy_tqdm(
     return _factory
 
 
+def _helper_fixed_terminal_size(*args: object, **kwargs: object) -> os.terminal_size:
+    """Signature-compatible stand-in for shutil.get_terminal_size (accepts `fallback`)."""
+    return os.terminal_size((120, 24))
+
+
 # =============================================================================
 # validate_stages_exist Tests
 # =============================================================================
@@ -248,7 +253,11 @@ def test_transfer_progress_prefix_width_is_stable(monkeypatch: pytest.MonkeyPatc
     bar = _HelperDummyBar()
     monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    monkeypatch.setattr(shutil, "get_terminal_size", lambda: os.terminal_size((120, 24)))
+    # The stand-in must accept the `fallback` kwarg: pytest's terminal reporter
+    # calls shutil.get_terminal_size(fallback=(80, 24)) while recomputing width, and
+    # a zero-arg replacement makes that raise TypeError inside a pytest hook, which
+    # under xdist kills the worker and aborts the whole run.
+    monkeypatch.setattr(shutil, "get_terminal_size", _helper_fixed_terminal_size)
 
     progress = cli_helpers.TransferProgress("Downloading")
     progress.callback(0, 2, "short.csv")
