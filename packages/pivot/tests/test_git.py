@@ -4,7 +4,6 @@ import subprocess
 from typing import TYPE_CHECKING, cast
 
 import dulwich.objects
-import dulwich.refs
 import dulwich.repo
 
 from conftest import init_git_repo
@@ -478,16 +477,14 @@ def test_read_matching_blobs_across_revisions_ignores_submodule_gitlink(
     assert isinstance(root_tree, dulwich.objects.Tree)
     root_tree.add(b"submodule", 0o160000, cast("dulwich.objects.ObjectID", b"0" * 40))
     repo.object_store.add_object(root_tree)
-    new_commit = dulwich.objects.Commit()
-    new_commit.tree = root_tree.id
-    new_commit.author = new_commit.committer = b"Test <test@test.com>"
-    new_commit.author_time = new_commit.commit_time = 0
-    new_commit.author_timezone = new_commit.commit_timezone = 0
-    new_commit.message = b"add gitlink"
-    new_commit.parents = [head.id]
-    repo.object_store.add_object(new_commit)
-    head_ref = b"HEAD"
-    repo.refs[cast("dulwich.refs.Ref", head_ref)] = new_commit.id
+    # do_commit updates HEAD to a new commit whose tree carries the gitlink,
+    # without hand-setting refs (which needs an awkward bytes->Ref cast).
+    repo.do_commit(
+        message=b"add gitlink",
+        tree=root_tree.id,
+        author=b"Test <test@test.com>",
+        committer=b"Test <test@test.com>",
+    )
 
     blobs = list(git.read_matching_blobs_across_revisions(["HEAD"], "", "*.lock"))
 
