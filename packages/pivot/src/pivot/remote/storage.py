@@ -108,10 +108,16 @@ def _get_s3_config() -> AioConfig:
     if _cached_s3_config is None:
         from aiobotocore.config import AioConfig
 
+        # botocore defaults max_pool_connections to 10, which silently throttles
+        # concurrent transfers below remote.jobs: even with a larger asyncio
+        # semaphore, only 10 connections are in flight, so many-small-file
+        # transfers stall on connection contention. Size the pool to the transfer
+        # concurrency so the semaphore is the real limit.
         _cached_s3_config = AioConfig(
             retries={"max_attempts": config.get_remote_retries()},
             connect_timeout=config.get_remote_connect_timeout(),
             read_timeout=STREAM_READ_TIMEOUT,
+            max_pool_connections=max(config.get_remote_jobs(), DEFAULT_CONCURRENCY),
         )
     return _cached_s3_config
 
