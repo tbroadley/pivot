@@ -25,7 +25,7 @@ from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_ha
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.storage import state as state_mod
 
@@ -791,6 +791,48 @@ def restore_missing_in_directory(
         )
         restored += 1
     return (restored, unavailable)
+
+
+def sum_blob_sizes(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
+    """Total on-disk size of the given cache blobs (missing blobs count as 0)."""
+    files_dir = cache_dir / "files"
+    total = 0
+    for file_hash in hashes:
+        try:
+            total += get_cache_path(files_dir, file_hash).stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def remove_cache_blobs(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
+    """Delete the given cache blobs and return the number actually removed.
+
+    Freed byte totals are computed by the caller via ``sum_blob_sizes`` (for the
+    dry-run/confirmation message), so this avoids a second full stat pass.
+
+    Blob files are read-only (0o444); deletion only needs a writable parent
+    directory, which _clear_path arranges without ever chmod-ing the blob itself
+    (blobs may be hardlinked to checked-out workspace files). Emptied prefix
+    directories are pruned. A blob that cannot be stat'd (missing, or any other
+    OSError) is skipped so one bad entry never leaves the cache half-collected.
+    """
+    files_dir = cache_dir / "files"
+    removed = 0
+    prefixes = set[pathlib.Path]()
+    for file_hash in hashes:
+        cache_path = get_cache_path(files_dir, file_hash)
+        try:
+            cache_path.stat()
+        except OSError:
+            continue
+        _clear_path(cache_path)
+        removed += 1
+        prefixes.add(cache_path.parent)
+    for prefix in prefixes:
+        with contextlib.suppress(OSError):
+            prefix.rmdir()  # only succeeds when empty
+    return removed
 
 
 def remove_output(path: pathlib.Path) -> None:

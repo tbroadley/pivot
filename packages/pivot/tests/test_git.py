@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
+import dulwich.objects
+import dulwich.repo
 
 from conftest import init_git_repo
 from pivot import git, project
@@ -415,3 +418,74 @@ def test_list_files_at_revision_with_branch(tmp_path: Path, monkeypatch: MonkeyP
     # HEAD should have both
     result_head = git.list_files_at_revision(".pivot/stages", "HEAD", "*.lock")
     assert sorted(result_head) == [".pivot/stages/stage1.lock", ".pivot/stages/stage2.lock"]
+
+
+def test_read_matching_blobs_across_revisions_dedups_shared_blobs(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    repo_path, commit = git_repo
+    stages_dir = repo_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True)
+    (stages_dir / "a.lock").write_text("shared")
+    commit("first")
+    subprocess.run(["git", "branch", "dup"], cwd=repo_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "checkout", "-b", "feature"], cwd=repo_path, check=True, capture_output=True
+    )
+    (stages_dir / "b.lock").write_text("unique-on-feature")
+    commit("second")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    blobs = list(
+        git.read_matching_blobs_across_revisions(
+            ["main", "dup", "feature"], ".pivot/stages", "*.lock"
+        )
+    )
+    # "shared" appears on all three refs but is read once; "unique-on-feature" once.
+    assert sorted(blobs) == [b"shared", b"unique-on-feature"]
+
+
+def test_read_matching_blobs_across_revisions_no_git_repo(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    assert list(git.read_matching_blobs_across_revisions(["main"], ".pivot/stages", "*.lock")) == []
+
+
+def test_read_matching_blobs_across_revisions_ignores_submodule_gitlink(
+    git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    """A submodule gitlink (mode 0o160000) must not be recursed into and crash the walk.
+
+    ``0o160000 & 0o40000 == 0o40000``, so a bitwise dir test would treat the gitlink as
+    a tree and look up its commit SHA -- absent from the parent object store -- raising
+    KeyError. The whole-tree ``.pvt`` scan (directory="") walks every entry, so a
+    submodule anywhere would abort gc.
+    """
+    repo_path, commit = git_repo
+    stages_dir = repo_path / ".pivot" / "stages"
+    stages_dir.mkdir(parents=True)
+    (stages_dir / "a.lock").write_text("lockdata")
+    commit("init")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    # Inject a gitlink entry at the root tree pointing at a commit not in this store.
+    repo = dulwich.repo.Repo(str(repo_path))
+    head = repo[repo.head()]
+    assert isinstance(head, dulwich.objects.Commit)
+    root_tree = repo[head.tree]
+    assert isinstance(root_tree, dulwich.objects.Tree)
+    root_tree.add(b"submodule", 0o160000, cast("dulwich.objects.ObjectID", b"0" * 40))
+    repo.object_store.add_object(root_tree)
+    # do_commit updates HEAD to a new commit whose tree carries the gitlink,
+    # without hand-setting refs (which needs an awkward bytes->Ref cast).
+    repo.do_commit(
+        message=b"add gitlink",
+        tree=root_tree.id,
+        author=b"Test <test@test.com>",
+        committer=b"Test <test@test.com>",
+    )
+
+    blobs = list(git.read_matching_blobs_across_revisions(["HEAD"], "", "*.lock"))
+
+    assert blobs == [b"lockdata"], "gitlink ignored; real lock blob still yielded"
