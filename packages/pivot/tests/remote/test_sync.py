@@ -934,6 +934,29 @@ def test_partition_local_by_remote_splits_present_and_absent(mocker: MockerFixtu
     assert local_only == {absent}
 
 
+def test_partition_local_by_remote_clears_stale_index_on_url_change(
+    mocker: MockerFixture,
+) -> None:
+    """A changed remote URL clears the cached index before comparing existence."""
+    stale = "1111111111111111"
+
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote.url = "s3://new-bucket/cache"
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://old-bucket/cache"
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={stale: False})
+
+    removable, local_only = sync.partition_local_by_remote(
+        {stale}, mock_remote, mock_state, "origin"
+    )
+
+    mock_state.remote_index_clear.assert_called_once_with("origin")
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://new-bucket/cache")
+    assert removable == set()
+    assert local_only == {stale}
+
+
 def test_partition_local_by_remote_empty_input(mocker: MockerFixture) -> None:
     """Empty input avoids any remote calls."""
     mock_remote = mocker.Mock(spec=remote_storage.S3Remote)

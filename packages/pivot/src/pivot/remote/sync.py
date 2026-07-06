@@ -433,6 +433,11 @@ def partition_local_by_remote(
     """
     if not hashes:
         return set[str](), set[str]()
+    # Mirror push/pull: revalidate the remote URL before trusting the cached
+    # index. A stale index (remote URL changed under the same name) could
+    # otherwise report a blob as backed up when it is absent from the current
+    # remote, letting gc delete a blob that is no longer re-fetchable.
+    _check_remote_url(state_db, remote_name, remote)
     status = asyncio.run(compare_status(hashes, remote, state_db, remote_name, jobs))
     return status["common"], status["local_only"]
 
