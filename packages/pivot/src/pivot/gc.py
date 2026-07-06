@@ -25,7 +25,7 @@ from pivot import git, project, yaml_config
 from pivot.storage import lock, track
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -110,40 +110,53 @@ def _hashes_from_pvt_bytes(raw: bytes | str) -> set[str]:
     return _hashes_from_ref(data)
 
 
-# Directories never worth walking for .pvt files; skipping them (especially a
-# main worktree's real .git object store) is a large speedup.
-_PRUNE_DIRS = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__", ".pivot"})
+# Directories never worth descending into when scanning a working tree: version
+# control, virtualenvs, caches. Skipping a main worktree's real .git object store
+# in particular is a large speedup.
+_PRUNE_DIRS = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__"})
+
+_PIVOT_DIR_NAME = ".pivot"
+_STAGES_DIR_NAME = "stages"
 
 
-def _iter_pvt_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
-    """Yield ``*.pvt`` paths under root, pruning version-control/env directories."""
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
-        for fname in filenames:
-            if fname.endswith(".pvt"):
-                yield pathlib.Path(dirpath) / fname
+def _stage_lock_hashes(stages_dir: pathlib.Path) -> set[str]:
+    """Blob hashes from every ``*.lock`` under a ``.pivot/stages`` directory."""
+    hashes = set[str]()
+    for lock_path in stages_dir.rglob("*.lock"):
+        try:
+            hashes |= _hashes_from_lock_bytes(lock_path.read_bytes())
+        except OSError as exc:
+            logger.debug(f"Could not read lock file {lock_path}: {exc}")
+    return hashes
 
 
 def referenced_hashes_in_tree(root: pathlib.Path) -> set[str]:
     """Blob hashes referenced by the on-disk working tree at ``root``.
 
-    Scans ``root/.pivot/stages/**/*.lock`` and every ``root/**/*.pvt`` file.
-    Includes uncommitted lock/tracking changes -- the case most likely to hold
-    blobs not yet on the remote.
+    A single pruned walk discovers every ``.pivot/stages/**/*.lock`` and every
+    ``*.pvt`` file anywhere under ``root``, so the pivot project may sit at the
+    worktree root or in any subdirectory -- no assumption about where ``.pivot``
+    lives. Includes uncommitted lock/tracking changes, the case most likely to
+    reference blobs not yet on the remote. Never descends into a ``.pivot``
+    directory (its stage locks are read directly and its cache is skipped).
     """
     hashes = set[str]()
-    stages_dir = root / lock.STAGES_REL_PATH
-    if stages_dir.is_dir():
-        for lock_path in stages_dir.rglob("*.lock"):
-            try:
-                hashes |= _hashes_from_lock_bytes(lock_path.read_bytes())
-            except OSError as exc:
-                logger.debug(f"Could not read lock file {lock_path}: {exc}")
-    for pvt_path in _iter_pvt_files(root):
-        try:
-            hashes |= _hashes_from_pvt_bytes(pvt_path.read_bytes())
-        except OSError as exc:
-            logger.debug(f"Could not read .pvt file {pvt_path}: {exc}")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
+        current = pathlib.Path(dirpath)
+        if current.name == _PIVOT_DIR_NAME:
+            stages_dir = current / _STAGES_DIR_NAME
+            if stages_dir.is_dir():
+                hashes |= _stage_lock_hashes(stages_dir)
+            dirnames[:] = []  # don't walk into .pivot (esp. a possibly-huge cache)
+            continue
+        for fname in filenames:
+            if fname.endswith(".pvt"):
+                pvt_path = current / fname
+                try:
+                    hashes |= _hashes_from_pvt_bytes(pvt_path.read_bytes())
+                except OSError as exc:
+                    logger.debug(f"Could not read .pvt file {pvt_path}: {exc}")
     return hashes
 
 
@@ -249,13 +262,11 @@ def collect_referenced_hashes(scope: GcScope) -> set[str]:
     if scope is GcScope.WORKSPACE:
         return referenced_hashes_in_tree(project.get_project_root())
 
-    # worktree_roots() yields git worktree roots, but referenced_hashes_in_tree
-    # expects the pivot project root. When .pivot lives in a subdirectory of the
-    # git repo, apply that same prefix to each worktree root.
-    prefix = git.get_project_prefix()
+    # referenced_hashes_in_tree discovers .pivot wherever it lives under each
+    # worktree, so a git worktree root works directly -- no assumption that every
+    # worktree places .pivot at the same relative subpath.
     hashes = set[str]()
     for root in worktree_roots():
-        proj_root = root / prefix if prefix is not None else root
-        hashes |= referenced_hashes_in_tree(proj_root)
+        hashes |= referenced_hashes_in_tree(root)
     hashes |= referenced_hashes_at_revisions(git.list_local_branches())
     return hashes

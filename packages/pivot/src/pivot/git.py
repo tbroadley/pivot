@@ -64,19 +64,6 @@ def _get_proj_prefix(git_root: Path, proj_root: Path) -> Path | None:
         return None
 
 
-def get_project_prefix() -> Path | None:
-    """Path of the pivot project root relative to the git root for the current checkout.
-
-    Returns None when the project root coincides with the git root or when not in a
-    git repo. Used to map a worktree's git root to its pivot project subdirectory.
-    """
-    result = _open_repo()
-    if result is None:
-        return None
-    _repo, git_root, proj_root = result
-    return _get_proj_prefix(git_root, proj_root)
-
-
 def _resolve_path(proj_prefix: Path | None, rel_path: str) -> str:
     """Resolve relative path accounting for project prefix."""
     return str(proj_prefix / rel_path) if proj_prefix else rel_path

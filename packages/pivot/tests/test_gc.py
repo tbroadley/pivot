@@ -363,6 +363,46 @@ def test_collect_referenced_hashes_all_with_pivot_in_subdir(
     assert _hash("a") in all_scope, "uncommitted lock under .pivot subdir must be collected"
 
 
+def test_collect_referenced_hashes_all_no_shared_prefix_assumption(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path, commit = git_repo
+    (repo_path / "f").write_text("x")
+    commit("init")
+    # Current checkout: .pivot at the repo root (prefix = none).
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    linked = repo_path.with_name(repo_path.name + "-wt")
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature", str(linked)],
+        cwd=repo_path,
+        check=True,
+        capture_output=True,
+    )
+    _write_lock(
+        repo_path / ".pivot" / "stages", "root", _lock_yaml([], [_file_entry("o", _hash("a"))])
+    )
+    # Linked worktree keeps .pivot in a subdir -- a DIFFERENT relative path than
+    # the current checkout. Must still be collected (no shared-prefix assumption).
+    _write_lock(
+        linked / "sub" / ".pivot" / "stages", "sub", _lock_yaml([], [_file_entry("o", _hash("b"))])
+    )
+
+    all_scope = gc.collect_referenced_hashes(gc.GcScope.ALL)
+    assert {_hash("a"), _hash("b")} <= all_scope
+
+
+def test_referenced_hashes_in_tree_skips_pivot_cache(tmp_path: pathlib.Path) -> None:
+    _write_lock(tmp_path / ".pivot" / "stages", "s", _lock_yaml([], [_file_entry("o", _hash("a"))]))
+    # A stray .pvt-looking file under .pivot (e.g. inside a local cache) must be
+    # ignored: gc never descends into .pivot beyond its stages dir.
+    cache_pvt = tmp_path / ".pivot" / "cache" / "bogus.pvt"
+    cache_pvt.parent.mkdir(parents=True)
+    _write_pvt(cache_pvt, _hash("z"))
+
+    assert gc.referenced_hashes_in_tree(tmp_path) == {_hash("a")}
+
+
 # =============================================================================
 # Cache blob helpers
 # =============================================================================
