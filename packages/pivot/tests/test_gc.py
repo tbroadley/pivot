@@ -205,7 +205,7 @@ def test_worktree_roots_skips_stale_worktree(git_repo: GitRepo) -> None:
 # =============================================================================
 
 
-def test_referenced_hashes_at_revision_reads_committed_files(
+def test_referenced_hashes_at_revisions_reads_committed_files(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo_path, commit = git_repo
@@ -216,7 +216,22 @@ def test_referenced_hashes_at_revision_reads_committed_files(
     _write_pvt(repo_path / "raw.csv.pvt", _hash("b"))
     commit("add pipeline state")
 
-    assert gc.referenced_hashes_at_revision("HEAD") == {_hash("a"), _hash("b")}
+    assert gc.referenced_hashes_at_revisions(["HEAD"]) == {_hash("a"), _hash("b")}
+
+
+def test_referenced_hashes_at_revisions_dedups_shared_blobs(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path, commit = git_repo
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    stages = repo_path / ".pivot" / "stages"
+    _write_lock(stages, "s", _lock_yaml([], [_file_entry("out", _hash("a"))]))
+    commit("main state")
+    subprocess.run(["git", "branch", "dup"], cwd=repo_path, check=True, capture_output=True)
+
+    # Same committed lock file on both refs -> union still just the one hash.
+    assert gc.referenced_hashes_at_revisions(["HEAD", "dup"]) == {_hash("a")}
 
 
 def test_list_local_branches(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:

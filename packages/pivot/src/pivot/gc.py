@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -24,9 +25,20 @@ from pivot import git, project
 from pivot.storage import lock, track
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
     from pivot.types import DepEntry, OutEntry
 
 logger = logging.getLogger(__name__)
+
+# gc parses hundreds of lock/.pvt files per worktree and revision, so use the
+# libyaml-backed loader (~9x faster than the pure-Python SafeLoader) when
+# available, falling back to the pure-Python loader otherwise.
+_YamlLoader: type[yaml.SafeLoader] | type[yaml.CSafeLoader]
+try:
+    _YamlLoader = yaml.CSafeLoader
+except AttributeError:  # libyaml not built into the PyYAML install
+    _YamlLoader = yaml.SafeLoader
 
 
 class GcScope(enum.Enum):
@@ -55,7 +67,7 @@ def _hashes_from_entries(entries: list[DepEntry] | list[OutEntry]) -> set[str]:
 def _hashes_from_lock_bytes(raw: bytes | str) -> set[str]:
     """Blob hashes referenced by a single lock file's contents."""
     try:
-        data = yaml.safe_load(raw)
+        data = yaml.load(raw, Loader=_YamlLoader)
     except yaml.YAMLError:
         return set[str]()
     if not lock.is_lock_data(data):
@@ -66,7 +78,7 @@ def _hashes_from_lock_bytes(raw: bytes | str) -> set[str]:
 def _hashes_from_pvt_bytes(raw: bytes | str) -> set[str]:
     """Blob hashes referenced by a single ``.pvt`` file's contents."""
     try:
-        data = yaml.safe_load(raw)
+        data = yaml.load(raw, Loader=_YamlLoader)
     except yaml.YAMLError:
         return set[str]()
     if not track.is_pvt_data(data):
@@ -74,6 +86,20 @@ def _hashes_from_pvt_bytes(raw: bytes | str) -> set[str]:
     if "manifest" in data:
         return {entry["hash"] for entry in data["manifest"]}
     return {data["hash"]}
+
+
+# Directories never worth walking for .pvt files; skipping them (especially a
+# main worktree's real .git object store) is a large speedup.
+_PRUNE_DIRS = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__", ".pivot"})
+
+
+def _iter_pvt_files(root: pathlib.Path) -> Iterator[pathlib.Path]:
+    """Yield ``*.pvt`` paths under root, pruning version-control/env directories."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
+        for fname in filenames:
+            if fname.endswith(".pvt"):
+                yield pathlib.Path(dirpath) / fname
 
 
 def referenced_hashes_in_tree(root: pathlib.Path) -> set[str]:
@@ -91,25 +117,24 @@ def referenced_hashes_in_tree(root: pathlib.Path) -> set[str]:
                 hashes |= _hashes_from_lock_bytes(lock_path.read_bytes())
             except OSError as exc:
                 logger.debug(f"Could not read lock file {lock_path}: {exc}")
-    for pvt in track.discover_pvt_files(root).values():
-        if "manifest" in pvt:
-            hashes.update(entry["hash"] for entry in pvt["manifest"])
-        else:
-            hashes.add(pvt["hash"])
+    for pvt_path in _iter_pvt_files(root):
+        try:
+            hashes |= _hashes_from_pvt_bytes(pvt_path.read_bytes())
+        except OSError as exc:
+            logger.debug(f"Could not read .pvt file {pvt_path}: {exc}")
     return hashes
 
 
-def referenced_hashes_at_revision(rev: str) -> set[str]:
-    """Blob hashes referenced by the committed lock/tracking files at ``rev``."""
+def referenced_hashes_at_revisions(revs: Sequence[str]) -> set[str]:
+    """Blob hashes referenced by committed lock/tracking files across revisions.
+
+    Each unique blob is read once even when it appears in many revisions, so
+    scanning every local branch is cheap despite near-identical lock files.
+    """
     hashes = set[str]()
-    stages_prefix = lock.STAGES_REL_PATH + "/"
-    lock_files = [
-        p for p in git.list_project_files_at_revision(rev, "*.lock") if p.startswith(stages_prefix)
-    ]
-    for raw in git.read_files_from_revision(lock_files, rev).values():
+    for raw in git.read_matching_blobs_across_revisions(revs, lock.STAGES_REL_PATH, "*.lock"):
         hashes |= _hashes_from_lock_bytes(raw)
-    pvt_files = git.list_project_files_at_revision(rev, "*.pvt")
-    for raw in git.read_files_from_revision(pvt_files, rev).values():
+    for raw in git.read_matching_blobs_across_revisions(revs, "", "*.pvt"):
         hashes |= _hashes_from_pvt_bytes(raw)
     return hashes
 
@@ -192,6 +217,5 @@ def collect_referenced_hashes(scope: GcScope) -> set[str]:
     hashes = set[str]()
     for root in worktree_roots():
         hashes |= referenced_hashes_in_tree(root)
-    for branch in git.list_local_branches():
-        hashes |= referenced_hashes_at_revision(branch)
+    hashes |= referenced_hashes_at_revisions(git.list_local_branches())
     return hashes
