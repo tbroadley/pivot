@@ -419,6 +419,24 @@ async def compare_status(
     return RemoteStatus(local_only=local_only, remote_only=set(), common=common)
 
 
+def partition_local_by_remote(
+    hashes: set[str],
+    remote: remote_mod.S3Remote,
+    state_db: state_mod.StateDB,
+    remote_name: str,
+    jobs: int | None = None,
+) -> tuple[set[str], set[str]]:
+    """Split hashes into (present_on_remote, absent_from_remote).
+
+    Used by ``pivot gc`` to only delete blobs that are safely backed up on the
+    remote and never lose local-only (unpushed) data.
+    """
+    if not hashes:
+        return set[str](), set[str]()
+    status = asyncio.run(compare_status(hashes, remote, state_db, remote_name, jobs))
+    return status["common"], status["local_only"]
+
+
 async def _push_async(
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,

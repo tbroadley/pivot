@@ -21,6 +21,7 @@ COMMAND_CATEGORIES = {
         "check-ignore",
         "doctor",
         "fingerprint",
+        "gc",
     ],
 }
 
@@ -84,6 +85,11 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "pivot.cli.update",
         "update",
         "Update imported artifacts from source repos.",
+    ),
+    "gc": (
+        "pivot.cli.gc",
+        "gc",
+        "Remove local cache blobs no longer referenced.",
     ),
 }
 

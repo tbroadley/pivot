@@ -306,3 +306,42 @@ def list_files_at_revision(directory: str, rev: str, pattern: str = "*") -> list
 
     files = _list_tree_files(ctx.repo, dir_sha, "", pattern)
     return [f"{directory}/{f}" for f in files]
+
+
+def list_project_files_at_revision(rev: str, pattern: str = "*") -> list[str]:
+    """List all project files (recursively) matching pattern at a git revision.
+
+    Paths are relative to the project root. Returns an empty list on any error
+    (invalid revision, project subtree missing at that revision, etc.).
+    """
+    ctx = _get_revision_context(rev)
+    if ctx is None:
+        return []
+
+    if ctx.proj_prefix is not None:
+        try:
+            _mode, tree_sha = dulwich.object_store.tree_lookup_path(
+                ctx.repo.__getitem__, ctx.commit.tree, str(ctx.proj_prefix).encode()
+            )
+        except KeyError:
+            logger.debug(f"Project subtree not found at revision {rev}")
+            return []
+    else:
+        tree_sha = ctx.commit.tree
+
+    return _list_tree_files(ctx.repo, tree_sha, "", pattern)
+
+
+def list_local_branches() -> list[str]:
+    """Return local branch short names (empty list if not a git repo)."""
+    result = _open_repo()
+    if result is None:
+        return []
+
+    repo, _git_root, _proj_root = result
+    prefix = b"refs/heads/"
+    branches = list[str]()
+    for ref in repo.get_refs():
+        if ref.startswith(prefix):
+            branches.append(ref[len(prefix) :].decode())
+    return branches

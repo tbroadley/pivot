@@ -909,3 +909,38 @@ def test_pull_excludes_dep_from_noncached_upstream_output(set_project_root: path
     result = sync.get_needed_hashes(["downstream"], state_dir, all_stages, set_project_root)
 
     assert result == {"downstream01"}, "Dep from a cache=False upstream output must not be fetched"
+
+
+# =============================================================================
+# partition_local_by_remote (used by pivot gc)
+# =============================================================================
+
+
+def test_partition_local_by_remote_splits_present_and_absent(mocker: MockerFixture) -> None:
+    """Blobs on the remote are removable; local-only blobs are protected."""
+    present = "1111111111111111"
+    absent = "2222222222222222"
+
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={present: True, absent: False})
+
+    removable, local_only = sync.partition_local_by_remote(
+        {present, absent}, mock_remote, mock_state, "origin"
+    )
+
+    assert removable == {present}
+    assert local_only == {absent}
+
+
+def test_partition_local_by_remote_empty_input(mocker: MockerFixture) -> None:
+    """Empty input avoids any remote calls."""
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+
+    removable, local_only = sync.partition_local_by_remote(set(), mock_remote, mock_state, "origin")
+
+    assert removable == set()
+    assert local_only == set()
+    mock_remote.bulk_exists.assert_not_called()
