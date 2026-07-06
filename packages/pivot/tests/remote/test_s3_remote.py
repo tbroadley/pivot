@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from botocore import exceptions as botocore_exc
 
-from pivot import exceptions
+from pivot import config, exceptions
 from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
@@ -1231,3 +1231,30 @@ def test_s3_remote_init_raises_on_missing_aioboto3(mocker: MockerFixture) -> Non
 
     with pytest.raises(exceptions.RemoteError, match="pip install pivot\\[s3\\]"):
         remote_mod.S3Remote("s3://bucket/prefix")
+
+
+# -----------------------------------------------------------------------------
+# S3 Client Config Tests
+# -----------------------------------------------------------------------------
+
+
+def test_get_s3_config_sizes_pool_to_remote_jobs(mocker: MockerFixture) -> None:
+    """max_pool_connections tracks remote.jobs so the pool never throttles concurrency."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=64)
+    try:
+        cfg = remote_mod._get_s3_config()
+        assert cfg.max_pool_connections == 64  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+    finally:
+        remote_mod._cached_s3_config = None
+
+
+def test_get_s3_config_pool_floors_at_default_concurrency(mocker: MockerFixture) -> None:
+    """A tiny remote.jobs still gets a pool at least DEFAULT_CONCURRENCY wide."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=2)
+    try:
+        cfg = remote_mod._get_s3_config()
+        assert cfg.max_pool_connections == remote_mod.DEFAULT_CONCURRENCY  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+    finally:
+        remote_mod._cached_s3_config = None
