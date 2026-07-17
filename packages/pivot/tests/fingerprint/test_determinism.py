@@ -6,6 +6,7 @@ invocations. This is critical because stages may be fingerprinted in different
 processes (main process vs worker) and must produce identical results.
 """
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -255,3 +256,86 @@ print(manifest["mod:constants.AGENTS"], manifest["mod:constants.NESTED"])
         results.append(result.stdout.strip())
 
     assert results[0] == results[1], f"Hashes differ across processes: {results}"
+
+
+@pytest.mark.slow
+def test_nested_frozenset_deterministic_across_hash_seeds(tmp_path: pathlib.Path) -> None:
+    """A frozenset nested inside a collection hashes identically across PYTHONHASHSEED values.
+
+    Regression: the nested frozenset used to reach json's `default=str` fallback, whose
+    `str(frozenset)` ordering depends on the hash seed, producing spurious cross-process
+    reruns.
+    """
+    module_file = tmp_path / "constants.py"
+    module_file.write_text(
+        'NESTED = (frozenset({"alpha", "beta", "gamma", "delta", "epsilon"}),)\n'
+    )
+
+    script = f"""\
+import sys
+sys.path.insert(0, {str(tmp_path)!r})
+
+import constants
+from pivot import fingerprint
+
+def stage():
+    return constants.NESTED
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(manifest["mod:constants.NESTED"])
+"""
+    results = list[str]()
+    for seed in ("0", "1", "12345"):
+        env = dict(os.environ)
+        env["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        results.append(result.stdout.strip())
+
+    assert len(set(results)) == 1, f"Nested frozenset hash varies with hash seed: {results}"
+
+
+@pytest.mark.slow
+def test_functional_enum_capture_deterministic_across_processes(tmp_path: pathlib.Path) -> None:
+    """A captured functionally-created enum member hashes stably across processes.
+
+    Regression: the source-less enum class fell back to an id()-based hash, which differs
+    every run and forced spurious reruns.
+    """
+    module_file = tmp_path / "constants.py"
+    module_file.write_text(
+        "import enum\n\nMode = enum.Enum('Mode', {'A': 'first', 'B': 'second'})\nDEFAULT = Mode.A\n"
+    )
+
+    script = f"""\
+import sys
+sys.path.insert(0, {str(tmp_path)!r})
+
+import constants
+from pivot import fingerprint
+
+def stage():
+    return constants.DEFAULT.value
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(manifest["mod:constants.DEFAULT"], manifest["mod:constants.DEFAULT.value"])
+"""
+    results = list[str]()
+    for seed in ("0", "1", "12345"):
+        env = dict(os.environ)
+        env["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        results.append(result.stdout.strip())
+
+    assert len(set(results)) == 1, f"Functional enum capture hash varies across runs: {results}"

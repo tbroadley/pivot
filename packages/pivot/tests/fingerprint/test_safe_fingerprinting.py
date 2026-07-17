@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -40,6 +41,32 @@ FROZEN_PYDANTIC = FrozenModel(value=1)
 IMMUTABLE_TUPLE = (1, 2)
 IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
+
+
+class Basis(enum.Enum):
+    FRONTIER = "frontier"
+    HEAD = "head"
+
+
+ENUM_MEMBER = Basis.FRONTIER
+
+
+class CallableBasis(enum.Enum):
+    A = 1
+    B = 2
+
+    def __call__(self) -> int:
+        return self.value
+
+
+CALLABLE_ENUM_MEMBER = CallableBasis.A
+
+
+class ComplexValueBasis(enum.Enum):
+    A = object()
+
+
+COMPLEX_ENUM_MEMBER = ComplexValueBasis.A
 
 
 def _callable_helper() -> int:
@@ -84,6 +111,18 @@ def _stage_uses_frozenset() -> int:
 
 def _stage_uses_primitive() -> int:
     return PRIMITIVE_INT
+
+
+def _stage_uses_enum_member() -> str:
+    return ENUM_MEMBER.value
+
+
+def _stage_uses_callable_enum_member() -> int:
+    return CALLABLE_ENUM_MEMBER()
+
+
+def _stage_uses_complex_enum_member() -> object:
+    return COMPLEX_ENUM_MEMBER.value
 
 
 def _stage_uses_callable() -> int:
@@ -150,10 +189,35 @@ def test_mutable_closure_capture_raises(
         pytest.param(_stage_uses_frozenset, id="frozenset"),
         pytest.param(_stage_uses_primitive, id="primitive"),
         pytest.param(_stage_uses_callable, id="callable"),
+        pytest.param(_stage_uses_enum_member, id="enum-member"),
     ],
 )
-def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], int]) -> None:
+def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
+
+
+def test_enum_member_capture_is_tracked() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_member)
+    assert manifest["enum:ENUM_MEMBER"] == "Basis.FRONTIER", (
+        "Captured enum member should be tracked by class-qualified name"
+    )
+
+
+def test_callable_enum_member_capture_is_tracked() -> None:
+    """An enum member is tracked via the enum path even when the enum defines __call__."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_enum_member)
+    assert manifest["enum:CALLABLE_ENUM_MEMBER"] == "CallableBasis.A", (
+        "Callable enum member must be tracked by name, not id()-hashed as a callable"
+    )
+    assert "func:CALLABLE_ENUM_MEMBER" not in manifest, (
+        "Callable enum member must not fall through to the callable branch"
+    )
+
+
+def test_enum_member_with_unencodable_value_raises() -> None:
+    """An enum whose value can't be soundly encoded errors instead of silently under-tracking."""
+    with pytest.raises(exceptions.StageDefinitionError, match="cannot be soundly fingerprinted"):
+        fingerprint.get_stage_fingerprint(_stage_uses_complex_enum_member)
 
 
 def test_unsafe_env_allows_mutable_capture(
@@ -170,10 +234,20 @@ def test_unsafe_env_allows_mutable_capture(
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
+INSTANCE_TUPLE = (MutableConfig(1),)
+CALLABLE_TUPLE = (_callable_helper, _callable_helper)
 
 
 def _stage_uses_nested_mutable_tuple() -> int:
     return len(NESTED_MUTABLE_TUPLE)
+
+
+def _stage_uses_instance_tuple() -> int:
+    return len(INSTANCE_TUPLE)
+
+
+def _stage_uses_callable_tuple() -> int:
+    return CALLABLE_TUPLE[0]()
 
 
 def _stage_uses_mutable_dict_for_config_test() -> int:
@@ -198,6 +272,21 @@ def test_unsafe_config_allows_mutable_capture(
     ), "Should warn when unsafe fingerprinting via config is enabled"
 
 
-def test_nested_mutable_in_tuple_allows_fingerprint() -> None:
-    """Tuple containing mutable list is allowed — tuples are immutable at top level."""
-    fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+def test_nested_mutable_in_tuple_raises() -> None:
+    """A tuple nesting a mutable list is rejected: its contents can change at runtime."""
+    with pytest.raises(exceptions.StageDefinitionError, match="nests a mutable list"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+
+
+def test_instance_in_tuple_raises() -> None:
+    """A tuple holding a class instance is rejected rather than silently under-tracked."""
+    with pytest.raises(exceptions.StageDefinitionError, match="element of type 'MutableConfig'"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_instance_tuple)
+
+
+def test_callable_tuple_allows_fingerprint() -> None:
+    """A tuple of callables (dispatch table) is still allowed; the callables are tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_tuple)
+    assert any(k.startswith("func:CALLABLE_TUPLE[") for k in manifest), (
+        "Callables inside the tuple should be tracked"
+    )

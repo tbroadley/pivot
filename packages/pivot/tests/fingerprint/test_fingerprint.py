@@ -217,39 +217,20 @@ class _HelperAnnotatedClass(_HelperBase):
         self.model = _HelperPydanticModel()
 
 
-@dataclasses.dataclass
-class _HelperDataClassNoMethods:
-    value: int
+def _helper_dataclass_method_dep(x: int) -> int:
+    return x + 1
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class _HelperDataClassWithMethod:
     value: int
 
     def custom(self) -> int:
-        return self.value
+        return _helper_dataclass_method_dep(self.value)
 
 
-@dataclasses.dataclass
-class _HelperDataClassWithDunder:
-    value: int
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
-class _HelperPydanticModelWithAllowedMethod(BaseModel):
-    value: int
-
-    def model_post_init(self, __context: typing.Any) -> None:
-        return None
-
-
-class _HelperPydanticModelWithUserMethod(BaseModel):
-    value: int
-
-    def compute(self) -> int:
-        return self.value + 1
+def _helper_stage_uses_dataclass_with_method(cfg: _HelperDataClassWithMethod) -> int:
+    return cfg.custom()
 
 
 def _helper_parse_annotation(expr: str) -> ast.AST:
@@ -1138,20 +1119,16 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
-def test_check_data_class_methods_allows_dunders_and_pydantic_hooks():
-    """Dunder methods and allowed Pydantic hooks should be allowed."""
-    fingerprint._check_data_class_methods(_HelperDataClassNoMethods)
-    fingerprint._check_data_class_methods(_HelperDataClassWithDunder)
-    fingerprint._check_data_class_methods(_HelperPydanticModelWithAllowedMethod)
-
-
-def test_check_data_class_methods_rejects_user_methods():
-    """User-defined methods on data classes should raise errors."""
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperDataClassWithMethod)
-
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperPydanticModelWithUserMethod)
+def test_data_class_with_methods_is_fingerprinted():
+    """Data classes may carry methods: they're fingerprinted, not rejected."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dataclass_with_method)
+    assert any(
+        k.startswith("method:") and k.endswith("._HelperDataClassWithMethod.custom")
+        for k in manifest
+    ), "Method should be fingerprinted as a dependency"
+    assert "func:_helper_dataclass_method_dep" in manifest, (
+        "Method's transitive dependency should be followed"
+    )
 
 
 def test_check_dynamic_name_access_allows_literal_getattr():
@@ -3177,3 +3154,69 @@ def invalidate_stage():
             fingerprint._state_db.close()
         fingerprint._state_db = None
         fingerprint._state_db_init_attempted = False
+
+
+def test_is_primitive_collection_allows_shared_subcollection():
+    """A collection referencing the same inner collection twice is not a false cycle."""
+    inner = (1, 2)
+    assert fingerprint._is_primitive_collection((inner, inner)) is True
+    assert fingerprint._is_primitive_collection({"a": inner, "b": inner}) is True
+    assert fingerprint._is_primitive_collection((frozenset({1, 2}), frozenset({1, 2}))) is True
+
+
+def test_is_primitive_collection_detects_genuine_cycle():
+    """A collection that transitively contains itself is still rejected."""
+    cyclic: list[object] = [1, 2]
+    cyclic.append(cyclic)
+    assert fingerprint._is_primitive_collection(cyclic) is False
+
+
+def test_serialize_value_for_hash_nested_set_order_independent():
+    """Nested sets built in different insertion orders serialize identically."""
+    a = fingerprint._serialize_value_for_hash(({3, 1, 2}, "x"))
+    b = fingerprint._serialize_value_for_hash(({2, 3, 1}, "x"))
+    assert a == b
+
+
+def test_serialize_value_for_hash_frozenset_in_dict_order_independent():
+    """A frozenset nested inside a dict value serializes deterministically."""
+    a = fingerprint._serialize_value_for_hash({"k": frozenset({2, 1})})
+    b = fingerprint._serialize_value_for_hash({"k": frozenset({1, 2})})
+    assert a == b
+
+
+def test_serialize_value_for_hash_is_type_preserving():
+    """Values JSON would otherwise conflate hash differently (type-tagged encoding)."""
+    ser = fingerprint._serialize_value_for_hash
+    assert ser((1, 2)) != ser([1, 2])
+    assert ser([1, 2]) != ser(frozenset({1, 2}))
+    assert ser((1, 2)) != ser(frozenset({1, 2}))
+    assert ser({1: "a"}) != ser({"1": "a"})  # int key vs str key
+    assert ser((b"1",)) != ser(("1",))  # bytes vs str element
+    assert ser((True,)) != ser((1,))  # bool vs int element
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class _HelperDunderDataClass:
+    value: int
+
+    def __post_init__(self) -> None:
+        pass
+
+
+def _helper_stage_uses_dunder_dataclass(cfg: _HelperDunderDataClass) -> int:
+    return cfg.value
+
+
+def test_only_authored_dunders_are_fingerprinted():
+    """User-authored __post_init__ is walked; dataclass-generated dunders are not."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dunder_dataclass)
+    assert any(
+        k.startswith("method:") and k.endswith("._HelperDunderDataClass.__post_init__")
+        for k in manifest
+    ), "User-authored __post_init__ should be fingerprinted"
+    for generated in ("__init__", "__eq__", "__lt__", "__hash__", "__repr__"):
+        assert not any(
+            k.startswith("method:") and k.endswith(f"._HelperDunderDataClass.{generated}")
+            for k in manifest
+        ), f"Generated {generated} should not be walked"
