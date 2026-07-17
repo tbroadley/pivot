@@ -238,6 +238,9 @@ INSTANCE_TUPLE = (MutableConfig(1),)
 CALLABLE_TUPLE = (_callable_helper, _callable_helper)
 ENUM_TUPLE = (Basis.FRONTIER, Basis.HEAD)
 ENUM_FROZENSET = frozenset({Basis.FRONTIER})
+FROZEN_DATACLASS_TUPLE = (FrozenConfig(value=1), FrozenConfig(value=2))
+FROZEN_PYDANTIC_TUPLE = (FrozenModel(value=1),)
+NESTED_FROZEN_TUPLE = (("first", FrozenConfig(value=1)), ("second", FrozenConfig(value=2)))
 
 
 def _stage_uses_enum_tuple() -> int:
@@ -246,6 +249,18 @@ def _stage_uses_enum_tuple() -> int:
 
 def _stage_uses_enum_frozenset() -> int:
     return len(ENUM_FROZENSET)
+
+
+def _stage_uses_frozen_dataclass_tuple() -> int:
+    return len(FROZEN_DATACLASS_TUPLE)
+
+
+def _stage_uses_frozen_pydantic_tuple() -> int:
+    return len(FROZEN_PYDANTIC_TUPLE)
+
+
+def _stage_uses_nested_frozen_tuple() -> int:
+    return len(NESTED_FROZEN_TUPLE)
 
 
 def _stage_uses_nested_mutable_tuple() -> int:
@@ -315,3 +330,25 @@ def test_enum_frozenset_allows_fingerprint_and_tracks_members() -> None:
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_frozenset)
     assert "const:ENUM_FROZENSET" in manifest, "The frozenset itself should be content-hashed"
     assert manifest["enum:ENUM_FROZENSET[0]"] == "Basis.FRONTIER"
+
+
+def test_frozen_dataclass_tuple_allows_fingerprint_and_tracks_class() -> None:
+    """A tuple of frozen dataclass instances is allowed, content-hashed, and its class tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_dataclass_tuple)
+    assert "const:FROZEN_DATACLASS_TUPLE" in manifest, "The tuple should be content-hashed"
+    assert "class:FROZEN_DATACLASS_TUPLE[0].__class__" in manifest, (
+        "Element class should be tracked"
+    )
+
+
+def test_frozen_pydantic_tuple_allows_fingerprint_and_tracks_class() -> None:
+    """A tuple of frozen pydantic instances is allowed, content-hashed, and its class tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_pydantic_tuple)
+    assert "const:FROZEN_PYDANTIC_TUPLE" in manifest, "The tuple should be content-hashed"
+    assert "class:FROZEN_PYDANTIC_TUPLE[0].__class__" in manifest, "Element class should be tracked"
+
+
+def test_nested_frozen_instance_tuple_allows_fingerprint() -> None:
+    """A tuple of (label, frozen-instance) tuples is allowed and content-hashed."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_nested_frozen_tuple)
+    assert "const:NESTED_FROZEN_TUPLE" in manifest, "The nested tuple should be content-hashed"

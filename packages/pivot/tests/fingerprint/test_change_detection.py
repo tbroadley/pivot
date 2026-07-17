@@ -1222,6 +1222,33 @@ def test_enum_tuple_member_value_change_causes_miss(module_dir: pathlib.Path) ->
     assert fp1 != fp2, "Enum-tuple member value change must cause miss"
 
 
+def test_frozen_instance_tuple_field_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Editing a frozen dataclass field inside a captured (nested) tuple invalidates the stage."""
+    helpers_py = module_dir / "test_change_frozentup_helpers.py"
+    template = (
+        "import dataclasses\n\n"
+        "@dataclasses.dataclass(frozen=True)\nclass Style:\n    marker: str\n\n"
+        'STYLES = (("bon", Style(marker="{marker}")),)\n'
+    )
+    helpers_py.write_text(template.format(marker="o"))
+
+    stage_py = module_dir / "test_change_frozentup_stage.py"
+    stage_py.write_text(
+        "from test_change_frozentup_helpers import STYLES\n\ndef stage():\n    return len(STYLES)\n"
+    )
+
+    mod = _import_fresh("test_change_frozentup_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "const:STYLES" in fp1, "Tuple holding a frozen dataclass should be content-hashed"
+
+    helpers_py.write_text(template.format(marker="square"))
+    _import_fresh("test_change_frozentup_helpers")
+    mod = _import_fresh("test_change_frozentup_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Frozen dataclass field change inside a tuple must cause miss"
+
+
 # =============================================================================
 # SECTION: Enum member value tracking (indirect, mutable, IntFlag, functional)
 # =============================================================================

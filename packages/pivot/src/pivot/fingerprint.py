@@ -888,11 +888,11 @@ def _find_unsound_collection_element(
 ) -> str | None:
     """Return a reason an immutable collection can't be soundly fingerprinted, else None.
 
-    Primitives are content-hashable; enum members are content-hashable and their class is tracked
-    (like a standalone enum capture); callables are tracked via _process_collection_dependency;
-    nested tuples/frozensets are inspected recursively. A nested mutable collection (dict/list/
-    set) or any other element (a class instance, etc.) means the collection's data can change
-    without a code change, so it is reported.
+    Primitives are content-hashable; enum members and frozen dataclass/pydantic instances are
+    content-hashable and their class is tracked (like a standalone capture); callables are tracked
+    via _process_collection_dependency; nested tuples/frozensets are inspected recursively. A
+    nested mutable collection (dict/list/set) or any other element (a mutable class instance, etc.)
+    means the collection's data can change without a code change, so it is reported.
     """
     if _seen is None:
         _seen = set()
@@ -905,6 +905,8 @@ def _find_unsound_collection_element(
             if isinstance(item, (bool, int, float, str, bytes, type(None))):
                 continue
             if isinstance(item, enum.Enum):
+                continue
+            if _is_frozen_dataclass(item) or _is_frozen_pydantic(item):
                 continue
             if callable(item):
                 continue
@@ -1383,17 +1385,14 @@ def _process_collection_dependency(
 ) -> None:
     """Scan collection for callable user code and enum members and add them to the manifest.
 
-    Enum members are tracked like a standalone enum capture (identity + value + class source), so
-    a tuple/frozenset of enums is fingerprinted as soundly as the members would be individually.
+    Enum members and frozen dataclass/pydantic instances are tracked like a standalone capture
+    (identity/class source), so a tuple/frozenset of them is fingerprinted as soundly as the
+    elements would be individually.
     """
     if isinstance(collection, dict):
         # Use sorted keys for deterministic ordering
         for key in sorted(collection.keys(), key=_sort_key):
-            value = collection[key]
-            if isinstance(value, enum.Enum):
-                _process_enum_dependency(f"enum:{name}[{key!r}]", value, manifest, visited)
-            elif callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
+            _process_collection_element(f"{name}[{key!r}]", collection[key], manifest, visited)
     else:
         # For sequences and sets, use enumerate for index-based keys
         # Sort sets for deterministic ordering
@@ -1403,10 +1402,22 @@ def _process_collection_dependency(
             else collection
         )
         for i, value in enumerate(items):
-            if isinstance(value, enum.Enum):
-                _process_enum_dependency(f"enum:{name}[{i}]", value, manifest, visited)
-            elif callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
+            _process_collection_element(f"{name}[{i}]", value, manifest, visited)
+
+
+def _process_collection_element(
+    ref: str, value: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Track an enum member, frozen dataclass/pydantic instance, or user callable held in a
+    collection — mirroring how the same value is tracked when captured standalone."""
+    if isinstance(value, enum.Enum):
+        _process_enum_dependency(f"enum:{ref}", value, manifest, visited)
+    elif _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
+        # Only frozen instances reach here — mutable ones are rejected upstream by
+        # _check_immutable_collection_capture. Track the class like a standalone frozen capture.
+        _process_instance_dependency(ref, value, manifest, visited)
+    elif callable(value) and is_user_code(value):
+        _add_callable_to_manifest(f"func:{ref}", value, manifest, visited)
 
 
 def _sort_key(value: Any) -> tuple[str, str]:
@@ -1429,6 +1440,10 @@ def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bo
     if isinstance(value, enum.Enum):
         # Enum members are immutable and content-hashable (canonicalized by qualname + name).
         # Their class is tracked separately via _process_collection_dependency.
+        return True
+    if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
+        # Frozen dataclass/pydantic instances are immutable-by-convention and content-hashable
+        # (via model_dump / repr). Their class is tracked via _process_collection_dependency.
         return True
     if isinstance(value, (list, tuple, set, frozenset, dict)):
         obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
