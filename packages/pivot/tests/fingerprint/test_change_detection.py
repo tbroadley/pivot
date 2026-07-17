@@ -1308,3 +1308,32 @@ def test_property_setter_transitive_dependency_change_causes_miss(module_dir: pa
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
     assert fp1 != fp2, "Property setter transitive dependency change must cause miss"
+
+
+def test_dunder_call_transitive_dependency_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Editing a helper called only by a user-authored __call__ invalidates the stage."""
+    helpers_py = module_dir / "test_change_dunder_helpers.py"
+    template = (
+        "def dep(x):\n    return x + {n}\n\n"
+        "class Adder:\n"
+        "    def __init__(self, base):\n        self.base = base\n\n"
+        "    def __call__(self, x):\n        return dep(self.base) + x\n"
+    )
+    helpers_py.write_text(template.format(n=1))
+
+    stage_py = module_dir / "test_change_dunder_stage.py"
+    stage_py.write_text(
+        "from test_change_dunder_helpers import Adder\n\ndef stage(adder: Adder):\n    return adder(1)\n"
+    )
+
+    mod = _import_fresh("test_change_dunder_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "method:Adder.__call__" in fp1, "User-authored __call__ should be fingerprinted"
+    assert "func:dep" in fp1, "__call__'s transitive dependency should be followed"
+
+    helpers_py.write_text(template.format(n=999))
+    _import_fresh("test_change_dunder_helpers")
+    mod = _import_fresh("test_change_dunder_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Behavioral dunder transitive dependency change must cause miss"

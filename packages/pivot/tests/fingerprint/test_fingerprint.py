@@ -3170,13 +3170,6 @@ def test_is_primitive_collection_detects_genuine_cycle():
     assert fingerprint._is_primitive_collection(cyclic) is False
 
 
-def test_serialize_value_for_hash_sorts_nested_frozenset():
-    """A frozenset nested inside a tuple is canonicalized (sorted), not str()-ed."""
-    result = fingerprint._serialize_value_for_hash((frozenset({"c", "a", "b"}),))
-    assert "frozenset" not in result
-    assert result == json.dumps([["a", "b", "c"]])
-
-
 def test_serialize_value_for_hash_nested_set_order_independent():
     """Nested sets built in different insertion orders serialize identically."""
     a = fingerprint._serialize_value_for_hash(({3, 1, 2}, "x"))
@@ -3184,8 +3177,43 @@ def test_serialize_value_for_hash_nested_set_order_independent():
     assert a == b
 
 
-def test_serialize_value_for_hash_frozenset_in_dict():
-    """A frozenset nested inside a dict value is canonicalized."""
-    result = fingerprint._serialize_value_for_hash({"k": frozenset({2, 1})})
-    assert "frozenset" not in result
-    assert result == json.dumps({"k": [1, 2]}, sort_keys=True)
+def test_serialize_value_for_hash_frozenset_in_dict_order_independent():
+    """A frozenset nested inside a dict value serializes deterministically."""
+    a = fingerprint._serialize_value_for_hash({"k": frozenset({2, 1})})
+    b = fingerprint._serialize_value_for_hash({"k": frozenset({1, 2})})
+    assert a == b
+
+
+def test_serialize_value_for_hash_is_type_preserving():
+    """Values JSON would otherwise conflate hash differently (type-tagged encoding)."""
+    ser = fingerprint._serialize_value_for_hash
+    assert ser((1, 2)) != ser([1, 2])
+    assert ser([1, 2]) != ser(frozenset({1, 2}))
+    assert ser((1, 2)) != ser(frozenset({1, 2}))
+    assert ser({1: "a"}) != ser({"1": "a"})  # int key vs str key
+    assert ser((b"1",)) != ser(("1",))  # bytes vs str element
+    assert ser((True,)) != ser((1,))  # bool vs int element
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class _HelperDunderDataClass:
+    value: int
+
+    def __post_init__(self) -> None:
+        pass
+
+
+def _helper_stage_uses_dunder_dataclass(cfg: _HelperDunderDataClass) -> int:
+    return cfg.value
+
+
+def test_only_authored_dunders_are_fingerprinted():
+    """User-authored __post_init__ is walked; dataclass-generated dunders are not."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dunder_dataclass)
+    assert "method:_HelperDunderDataClass.__post_init__" in manifest, (
+        "User-authored __post_init__ should be fingerprinted"
+    )
+    for generated in ("__init__", "__eq__", "__lt__", "__hash__", "__repr__"):
+        assert f"method:_HelperDunderDataClass.{generated}" not in manifest, (
+            f"Generated {generated} should not be walked"
+        )

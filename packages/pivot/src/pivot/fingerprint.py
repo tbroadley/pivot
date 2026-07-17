@@ -644,6 +644,62 @@ def _process_class_body_dependencies(
     _process_class_methods(cls, manifest, visited)
 
 
+# Dunders users typically author with real logic AND that dataclass/pydantic/namedtuple do
+# NOT auto-generate. Walking these follows their transitive deps; excluding the generated ones
+# (__init__, __eq__, ordering, __hash__, __repr__, frozen __setattr__, pickling hooks, etc.)
+# avoids churn from synthesized code. Body edits to any dunder are still caught by the class AST.
+_FINGERPRINTED_DUNDERS = frozenset(
+    {
+        "__call__",
+        "__str__",
+        "__bytes__",
+        "__format__",
+        "__getattr__",
+        "__len__",
+        "__length_hint__",
+        "__contains__",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+        "__iter__",
+        "__next__",
+        "__reversed__",
+        "__enter__",
+        "__exit__",
+        "__aenter__",
+        "__aexit__",
+        "__aiter__",
+        "__anext__",
+        "__await__",
+        "__post_init__",
+        "__add__",
+        "__radd__",
+        "__iadd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__floordiv__",
+        "__mod__",
+        "__pow__",
+        "__matmul__",
+        "__and__",
+        "__or__",
+        "__xor__",
+        "__invert__",
+        "__neg__",
+        "__pos__",
+        "__abs__",
+        "__round__",
+        "__index__",
+        "__int__",
+        "__float__",
+        "__bool__",
+    }
+)
+
+
 def _member_functions(member: Any) -> list[tuple[str, Any]]:
     """Return the underlying (key-suffix, function) pairs a class member wraps.
 
@@ -678,10 +734,11 @@ def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int
     callable so changes to what it depends on invalidate the stage too — the same guarantee
     standalone functions get. This is why data classes may carry methods without breaking
     change detection. Covers plain methods, classmethods, staticmethods, properties
-    (getter/setter/deleter), and functools.cached_property.
+    (getter/setter/deleter), functools.cached_property, and user-authored behavioral
+    dunders (see `_FINGERPRINTED_DUNDERS`).
     """
     for name, member in vars(cls).items():
-        if name.startswith("__") and name.endswith("__"):
+        if name.startswith("__") and name.endswith("__") and name not in _FINGERPRINTED_DUNDERS:
             continue
         for suffix, func in _member_functions(member):
             if callable(func) and is_user_code(func):
@@ -823,6 +880,68 @@ def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
     raise exceptions.StageDefinitionError(message)
 
 
+def _find_unsound_collection_element(
+    value: tuple[Any, ...] | frozenset[Any], _seen: set[int] | None = None
+) -> str | None:
+    """Return a reason an immutable collection can't be soundly fingerprinted, else None.
+
+    Primitives are content-hashable; callables are tracked via _process_collection_dependency;
+    nested tuples/frozensets are inspected recursively. A nested mutable collection (dict/list/
+    set) or any other element (a class instance, etc.) means the collection's data can change
+    without a code change, so it is reported.
+    """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(cast("object", value))
+    if obj_id in _seen:
+        return None
+    _seen.add(obj_id)
+    try:
+        for item in value:
+            if isinstance(item, (bool, int, float, str, bytes, type(None))):
+                continue
+            if callable(item):
+                continue
+            if isinstance(item, (dict, list, set)):
+                return f"nests a mutable {type(cast('object', item)).__name__}"
+            if isinstance(item, (tuple, frozenset)):
+                nested = _find_unsound_collection_element(
+                    cast("tuple[Any, ...] | frozenset[Any]", item), _seen
+                )
+                if nested is not None:
+                    return nested
+                continue
+            return f"contains an element of type '{type(cast('object', item)).__name__}'"
+        return None
+    finally:
+        _seen.discard(obj_id)
+
+
+def _check_immutable_collection_capture(var_name: str, value: Any, stage_name: str) -> None:
+    """Reject a captured tuple/frozenset that nests mutable state or an unsupported element.
+
+    Keeps immutable-collection capture consistent with bare mutable capture: a `(1, [2, 3])`
+    tuple can be mutated at runtime just like a bare list, and a `(SomeInstance(),)` tuple
+    would otherwise be silently dropped from the fingerprint. Honors unsafe_fingerprinting.
+    """
+    reason = _find_unsound_collection_element(value)
+    if reason is None:
+        return
+    message = (
+        f"Stage '{stage_name}': closure captures '{var_name}' "
+        f"({type(value).__name__}) which {reason}.\n"
+        "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
+        "outputs.\n"
+        "Fix: use only primitives, callables, or nested tuples/frozensets of these; or pass "
+        "the data via StageParams or a Dep(...) input.\n"
+        "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+    )
+    if _is_unsafe_fingerprinting_enabled():
+        _logger.warning(message)
+        return
+    raise exceptions.StageDefinitionError(message)
+
+
 def _is_frozen_dataclass(value: Any) -> bool:
     if not dataclasses.is_dataclass(value):
         return False
@@ -903,14 +1022,15 @@ def _process_closure_values(
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
             if isinstance(value, (dict, list, set)):
                 _check_mutable_capture(name, value, stage_name)
-            elif _is_primitive_collection(cast("object", value)):
-                # Immutable collections (tuple/frozenset) of primitives are safe to hash by
-                # content, matching qualified module access (_process_module_dependency).
-                # Non-primitive tuples fall through to callable-only tracking below, since
-                # their contents may be mutable.
-                manifest[f"const:{name}"] = xxhash.xxh64(
-                    _serialize_value_for_hash(value).encode()
-                ).hexdigest()
+            else:
+                # Immutable containers (tuple/frozenset): reject any that nest a mutable
+                # collection or an element we can't soundly fingerprint, then content-hash
+                # the pure-primitive ones (callables inside are tracked below regardless).
+                _check_immutable_collection_capture(name, value, stage_name)
+                if _is_primitive_collection(cast("object", value)):
+                    manifest[f"const:{name}"] = xxhash.xxh64(
+                        _serialize_value_for_hash(value).encode()
+                    ).hexdigest()
             _process_collection_dependency(
                 name,
                 cast(
@@ -1206,31 +1326,47 @@ def _discover_pydantic_field_types(
 
 
 def _canonicalize_for_hash(value: Any) -> Any:
-    """Recursively convert a value into a JSON-serializable, order-stable form.
+    """Convert a value into a JSON-serializable, order-stable, TYPE-TAGGED form.
 
-    Sets and frozensets are sorted at every depth — not just the top level — so that a
-    set/frozenset nested inside a list, tuple, or dict does not reach `json.dumps`'s
-    `default=str` fallback, whose `str(frozenset)` output depends on `PYTHONHASHSEED` and
-    thus varies across processes. Tuples become lists so `(1, 2)` serializes identically
-    regardless of nesting.
+    Every node carries a type tag so values JSON would otherwise conflate stay distinct:
+    `(1, 2)` vs `[1, 2]` vs `frozenset({1, 2})`, `b"1"` vs `"1"`, and dict keys `1` vs `"1"`
+    (JSON coerces int keys to strings). Sets/frozensets and dicts are sorted at every depth
+    for cross-process stability — their native iteration order depends on `PYTHONHASHSEED`.
     """
+    if isinstance(value, bool):  # before int: bool is a subclass of int
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", value]
+    if isinstance(value, float):
+        return ["float", repr(value)]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, bytes):
+        return ["bytes", value.hex()]
+    if value is None:
+        return ["none"]
     if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, (list, tuple)):
-        return [_canonicalize_for_hash(item) for item in cast("list[Any]", value)]
+        return ["model", type(value).__qualname__, _canonicalize_for_hash(value.model_dump())]
+    if isinstance(value, list):
+        return ["list", [_canonicalize_for_hash(item) for item in cast("list[Any]", value)]]
+    if isinstance(value, tuple):
+        return ["tuple", [_canonicalize_for_hash(item) for item in cast("tuple[Any, ...]", value)]]
     if isinstance(value, (set, frozenset)):
+        tag = "frozenset" if isinstance(value, frozenset) else "set"
         canon = [_canonicalize_for_hash(item) for item in cast("set[Any]", value)]
-        return sorted(canon, key=lambda x: json.dumps(x, sort_keys=True, default=str))
+        return [tag, sorted(canon, key=lambda x: json.dumps(x))]
     if isinstance(value, dict):
-        return {k: _canonicalize_for_hash(v) for k, v in cast("dict[Any, Any]", value).items()}
-    return value
+        pairs = [
+            [_canonicalize_for_hash(k), _canonicalize_for_hash(v)]
+            for k, v in cast("dict[Any, Any]", value).items()
+        ]
+        return ["dict", sorted(pairs, key=lambda kv: json.dumps(kv[0]))]
+    return ["repr", repr(value)]
 
 
 def _serialize_value_for_hash(value: Any) -> str:
-    """Serialize a value to a stable string for hashing."""
-    if hasattr(value, "model_dump") or isinstance(value, (list, tuple, set, frozenset, dict)):
-        return json.dumps(_canonicalize_for_hash(value), sort_keys=True, default=str)
-    return repr(value)
+    """Serialize a value to a stable, type-distinguishing string for hashing."""
+    return json.dumps(_canonicalize_for_hash(value), sort_keys=True, default=str)
 
 
 def _process_collection_dependency(

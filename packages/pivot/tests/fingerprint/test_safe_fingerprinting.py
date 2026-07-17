@@ -234,10 +234,20 @@ def test_unsafe_env_allows_mutable_capture(
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
+INSTANCE_TUPLE = (MutableConfig(1),)
+CALLABLE_TUPLE = (_callable_helper, _callable_helper)
 
 
 def _stage_uses_nested_mutable_tuple() -> int:
     return len(NESTED_MUTABLE_TUPLE)
+
+
+def _stage_uses_instance_tuple() -> int:
+    return len(INSTANCE_TUPLE)
+
+
+def _stage_uses_callable_tuple() -> int:
+    return CALLABLE_TUPLE[0]()
 
 
 def _stage_uses_mutable_dict_for_config_test() -> int:
@@ -262,6 +272,21 @@ def test_unsafe_config_allows_mutable_capture(
     ), "Should warn when unsafe fingerprinting via config is enabled"
 
 
-def test_nested_mutable_in_tuple_allows_fingerprint() -> None:
-    """Tuple containing mutable list is allowed — tuples are immutable at top level."""
-    fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+def test_nested_mutable_in_tuple_raises() -> None:
+    """A tuple nesting a mutable list is rejected: its contents can change at runtime."""
+    with pytest.raises(exceptions.StageDefinitionError, match="nests a mutable list"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+
+
+def test_instance_in_tuple_raises() -> None:
+    """A tuple holding a class instance is rejected rather than silently under-tracked."""
+    with pytest.raises(exceptions.StageDefinitionError, match="element of type 'MutableConfig'"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_instance_tuple)
+
+
+def test_callable_tuple_allows_fingerprint() -> None:
+    """A tuple of callables (dispatch table) is still allowed; the callables are tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_tuple)
+    assert any(k.startswith("func:CALLABLE_TUPLE[") for k in manifest), (
+        "Callables inside the tuple should be tracked"
+    )
