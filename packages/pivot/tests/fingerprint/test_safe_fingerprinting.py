@@ -236,6 +236,16 @@ def test_unsafe_env_allows_mutable_capture(
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
 INSTANCE_TUPLE = (MutableConfig(1),)
 CALLABLE_TUPLE = (_callable_helper, _callable_helper)
+ENUM_TUPLE = (Basis.FRONTIER, Basis.HEAD)
+ENUM_FROZENSET = frozenset({Basis.FRONTIER})
+
+
+def _stage_uses_enum_tuple() -> int:
+    return len(ENUM_TUPLE)
+
+
+def _stage_uses_enum_frozenset() -> int:
+    return len(ENUM_FROZENSET)
 
 
 def _stage_uses_nested_mutable_tuple() -> int:
@@ -290,3 +300,18 @@ def test_callable_tuple_allows_fingerprint() -> None:
     assert any(k.startswith("func:CALLABLE_TUPLE[") for k in manifest), (
         "Callables inside the tuple should be tracked"
     )
+
+
+def test_enum_tuple_allows_fingerprint_and_tracks_members() -> None:
+    """A tuple of enum members is allowed (like a standalone enum) and each member is tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_tuple)
+    assert "const:ENUM_TUPLE" in manifest, "The tuple itself should be content-hashed"
+    assert manifest["enum:ENUM_TUPLE[0]"] == "Basis.FRONTIER"
+    assert manifest["enum:ENUM_TUPLE[1]"] == "Basis.HEAD"
+
+
+def test_enum_frozenset_allows_fingerprint_and_tracks_members() -> None:
+    """A frozenset of enum members is allowed and its members are tracked by name."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_frozenset)
+    assert "const:ENUM_FROZENSET" in manifest, "The frozenset itself should be content-hashed"
+    assert manifest["enum:ENUM_FROZENSET[0]"] == "Basis.FRONTIER"

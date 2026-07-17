@@ -888,7 +888,8 @@ def _find_unsound_collection_element(
 ) -> str | None:
     """Return a reason an immutable collection can't be soundly fingerprinted, else None.
 
-    Primitives are content-hashable; callables are tracked via _process_collection_dependency;
+    Primitives are content-hashable; enum members are content-hashable and their class is tracked
+    (like a standalone enum capture); callables are tracked via _process_collection_dependency;
     nested tuples/frozensets are inspected recursively. A nested mutable collection (dict/list/
     set) or any other element (a class instance, etc.) means the collection's data can change
     without a code change, so it is reported.
@@ -902,6 +903,8 @@ def _find_unsound_collection_element(
     try:
         for item in value:
             if isinstance(item, (bool, int, float, str, bytes, type(None))):
+                continue
+            if isinstance(item, enum.Enum):
                 continue
             if callable(item):
                 continue
@@ -1378,12 +1381,18 @@ def _process_collection_dependency(
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
-    """Scan collection for callable user code and add to manifest."""
+    """Scan collection for callable user code and enum members and add them to the manifest.
+
+    Enum members are tracked like a standalone enum capture (identity + value + class source), so
+    a tuple/frozenset of enums is fingerprinted as soundly as the members would be individually.
+    """
     if isinstance(collection, dict):
         # Use sorted keys for deterministic ordering
         for key in sorted(collection.keys(), key=_sort_key):
             value = collection[key]
-            if callable(value) and is_user_code(value):
+            if isinstance(value, enum.Enum):
+                _process_enum_dependency(f"enum:{name}[{key!r}]", value, manifest, visited)
+            elif callable(value) and is_user_code(value):
                 _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
     else:
         # For sequences and sets, use enumerate for index-based keys
@@ -1394,7 +1403,9 @@ def _process_collection_dependency(
             else collection
         )
         for i, value in enumerate(items):
-            if callable(value) and is_user_code(value):
+            if isinstance(value, enum.Enum):
+                _process_enum_dependency(f"enum:{name}[{i}]", value, manifest, visited)
+            elif callable(value) and is_user_code(value):
                 _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
 
 
@@ -1414,6 +1425,10 @@ def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bo
     for a cycle — otherwise its contents would be silently dropped from the fingerprint.
     """
     if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return True
+    if isinstance(value, enum.Enum):
+        # Enum members are immutable and content-hashable (canonicalized by qualname + name).
+        # Their class is tracked separately via _process_collection_dependency.
         return True
     if isinstance(value, (list, tuple, set, frozenset, dict)):
         obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown

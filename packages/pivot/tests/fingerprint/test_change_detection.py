@@ -1136,6 +1136,92 @@ def test_shared_nested_tuple_constant_change_causes_miss(module_dir: pathlib.Pat
     assert fp1 != fp2, "Shared nested-tuple content change must cause miss"
 
 
+def test_enum_tuple_member_selection_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Swapping a member inside a captured tuple-of-enums invalidates the stage."""
+    helpers_py = module_dir / "test_change_enumtup_helpers.py"
+    template = (
+        "import enum\n\n"
+        'class Basis(enum.Enum):\n    FRONTIER = "frontier"\n    HEAD = "head"\n    ALL = "all"\n\n'
+        "EXCLUDE = (Basis.FRONTIER, Basis.{member})\n"
+    )
+    helpers_py.write_text(template.format(member="HEAD"))
+
+    stage_py = module_dir / "test_change_enumtup_stage.py"
+    stage_py.write_text(
+        "from test_change_enumtup_helpers import EXCLUDE\n\ndef stage():\n    return len(EXCLUDE)\n"
+    )
+
+    mod = _import_fresh("test_change_enumtup_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "const:EXCLUDE" in fp1, "Tuple of enums should be content-hashed"
+    assert fp1["enum:EXCLUDE[1]"] == "Basis.HEAD", "Each enum member should be tracked"
+
+    helpers_py.write_text(template.format(member="ALL"))
+    _import_fresh("test_change_enumtup_helpers")
+    mod = _import_fresh("test_change_enumtup_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Enum-tuple member selection change must cause miss"
+
+
+def test_dispatch_dict_enum_value_change_causes_miss(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under unsafe fingerprinting, enum members held as dict values are tracked and edits miss."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    helpers_py = module_dir / "test_dispatch_enum_helpers.py"
+    template = (
+        "import enum\n\n"
+        'class Basis(enum.Enum):\n    FRONTIER = "{value}"\n    HEAD = "head"\n\n'
+        'DISPATCH = {{"a": Basis.FRONTIER}}\n'
+    )
+    helpers_py.write_text(template.format(value="frontier"))
+
+    stage_py = module_dir / "test_dispatch_enum_stage.py"
+    stage_py.write_text(
+        "from test_dispatch_enum_helpers import DISPATCH\n\ndef stage():\n    return DISPATCH['a'].value\n"
+    )
+
+    mod = _import_fresh("test_dispatch_enum_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert fp1["enum:DISPATCH['a']"] == "Basis.FRONTIER", (
+        "Dict-valued enum member should be tracked"
+    )
+
+    helpers_py.write_text(template.format(value="frontier_v2"))
+    _import_fresh("test_dispatch_enum_helpers")
+    mod = _import_fresh("test_dispatch_enum_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Enum value change in a dispatch dict must cause miss"
+
+
+def test_enum_tuple_member_value_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Editing the value of an enum member held in a captured tuple invalidates the stage."""
+    helpers_py = module_dir / "test_change_enumtupval_helpers.py"
+    template = (
+        "import enum\n\n"
+        'class Basis(enum.Enum):\n    FRONTIER = "{value}"\n    HEAD = "head"\n\n'
+        "EXCLUDE = (Basis.FRONTIER,)\n"
+    )
+    helpers_py.write_text(template.format(value="frontier"))
+
+    stage_py = module_dir / "test_change_enumtupval_stage.py"
+    stage_py.write_text(
+        "from test_change_enumtupval_helpers import EXCLUDE\n\ndef stage():\n    return len(EXCLUDE)\n"
+    )
+
+    mod = _import_fresh("test_change_enumtupval_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    helpers_py.write_text(template.format(value="frontier_v2"))
+    _import_fresh("test_change_enumtupval_helpers")
+    mod = _import_fresh("test_change_enumtupval_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Enum-tuple member value change must cause miss"
+
+
 # =============================================================================
 # SECTION: Enum member value tracking (indirect, mutable, IntFlag, functional)
 # =============================================================================
