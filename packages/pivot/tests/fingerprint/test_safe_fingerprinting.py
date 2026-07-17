@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -40,6 +41,14 @@ FROZEN_PYDANTIC = FrozenModel(value=1)
 IMMUTABLE_TUPLE = (1, 2)
 IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
+
+
+class Basis(enum.Enum):
+    FRONTIER = "frontier"
+    HEAD = "head"
+
+
+ENUM_MEMBER = Basis.FRONTIER
 
 
 def _callable_helper() -> int:
@@ -84,6 +93,10 @@ def _stage_uses_frozenset() -> int:
 
 def _stage_uses_primitive() -> int:
     return PRIMITIVE_INT
+
+
+def _stage_uses_enum_member() -> str:
+    return ENUM_MEMBER.value
 
 
 def _stage_uses_callable() -> int:
@@ -150,10 +163,18 @@ def test_mutable_closure_capture_raises(
         pytest.param(_stage_uses_frozenset, id="frozenset"),
         pytest.param(_stage_uses_primitive, id="primitive"),
         pytest.param(_stage_uses_callable, id="callable"),
+        pytest.param(_stage_uses_enum_member, id="enum-member"),
     ],
 )
-def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], int]) -> None:
+def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
+
+
+def test_enum_member_capture_is_tracked() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_member)
+    assert manifest["enum:ENUM_MEMBER"] == "Basis.FRONTIER", (
+        "Captured enum member should be tracked by class-qualified name"
+    )
 
 
 def test_unsafe_env_allows_mutable_capture(

@@ -217,39 +217,20 @@ class _HelperAnnotatedClass(_HelperBase):
         self.model = _HelperPydanticModel()
 
 
-@dataclasses.dataclass
-class _HelperDataClassNoMethods:
-    value: int
+def _helper_dataclass_method_dep(x: int) -> int:
+    return x + 1
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class _HelperDataClassWithMethod:
     value: int
 
     def custom(self) -> int:
-        return self.value
+        return _helper_dataclass_method_dep(self.value)
 
 
-@dataclasses.dataclass
-class _HelperDataClassWithDunder:
-    value: int
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-
-class _HelperPydanticModelWithAllowedMethod(BaseModel):
-    value: int
-
-    def model_post_init(self, __context: typing.Any) -> None:
-        return None
-
-
-class _HelperPydanticModelWithUserMethod(BaseModel):
-    value: int
-
-    def compute(self) -> int:
-        return self.value + 1
+def _helper_stage_uses_dataclass_with_method(cfg: _HelperDataClassWithMethod) -> int:
+    return cfg.custom()
 
 
 def _helper_parse_annotation(expr: str) -> ast.AST:
@@ -1138,20 +1119,15 @@ def test_hash_function_no_code_object():
     assert len(h) == 16  # xxhash64 hexdigest
 
 
-def test_check_data_class_methods_allows_dunders_and_pydantic_hooks():
-    """Dunder methods and allowed Pydantic hooks should be allowed."""
-    fingerprint._check_data_class_methods(_HelperDataClassNoMethods)
-    fingerprint._check_data_class_methods(_HelperDataClassWithDunder)
-    fingerprint._check_data_class_methods(_HelperPydanticModelWithAllowedMethod)
-
-
-def test_check_data_class_methods_rejects_user_methods():
-    """User-defined methods on data classes should raise errors."""
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperDataClassWithMethod)
-
-    with pytest.raises(exceptions.StageDefinitionError, match="Data class"):
-        fingerprint._check_data_class_methods(_HelperPydanticModelWithUserMethod)
+def test_data_class_with_methods_is_fingerprinted():
+    """Data classes may carry methods: they're fingerprinted, not rejected."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dataclass_with_method)
+    assert "method:_HelperDataClassWithMethod.custom" in manifest, (
+        "Method should be fingerprinted as a dependency"
+    )
+    assert "func:_helper_dataclass_method_dep" in manifest, (
+        "Method's transitive dependency should be followed"
+    )
 
 
 def test_check_dynamic_name_access_allows_literal_getattr():

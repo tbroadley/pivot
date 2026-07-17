@@ -993,3 +993,113 @@ def stage():
     assert "func:upper" in fp, (
         "Attribute name colliding with global should be over-included (benign)"
     )
+
+
+# =============================================================================
+# SECTION: Data class methods, enums, and immutable-collection constants
+# =============================================================================
+
+
+def test_dataclass_method_transitive_dependency_change_causes_miss(
+    module_dir: pathlib.Path,
+) -> None:
+    """Editing a helper called by a data class method invalidates the stage."""
+    helpers_py = module_dir / "test_change_dcmethod_helpers.py"
+    template = (
+        "import dataclasses\n\n"
+        "def dep(x):\n    return x + {n}\n\n"
+        "@dataclasses.dataclass(frozen=True)\n"
+        "class Cfg:\n"
+        "    value: int\n\n"
+        "    def compute(self):\n        return dep(self.value)\n"
+    )
+    helpers_py.write_text(template.format(n=1))
+
+    stage_py = module_dir / "test_change_dcmethod_stage.py"
+    stage_py.write_text(
+        "from test_change_dcmethod_helpers import Cfg\n\ndef stage(cfg: Cfg):\n    return cfg.compute()\n"
+    )
+
+    mod = _import_fresh("test_change_dcmethod_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "method:Cfg.compute" in fp1, "Data class method should be fingerprinted"
+    assert "func:dep" in fp1, "Method's transitive dependency should be followed"
+
+    helpers_py.write_text(template.format(n=999))
+    _import_fresh("test_change_dcmethod_helpers")
+    mod = _import_fresh("test_change_dcmethod_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Data class method's transitive dependency change must cause miss"
+
+
+def test_enum_member_selection_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Repointing a captured enum-member constant to another member invalidates."""
+    helpers_py = module_dir / "test_change_enum_helpers.py"
+    template = (
+        "import enum\n\n"
+        'class Basis(enum.Enum):\n    FRONTIER = "frontier"\n    HEAD = "head"\n\n'
+        "DEFAULT = Basis.{member}\n"
+    )
+    helpers_py.write_text(template.format(member="FRONTIER"))
+
+    stage_py = module_dir / "test_change_enum_stage.py"
+    stage_py.write_text(
+        "from test_change_enum_helpers import DEFAULT\n\ndef stage():\n    return DEFAULT.value\n"
+    )
+
+    mod = _import_fresh("test_change_enum_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert fp1["enum:DEFAULT"] == "Basis.FRONTIER", "Captured enum member should be tracked"
+
+    helpers_py.write_text(template.format(member="HEAD"))
+    _import_fresh("test_change_enum_helpers")
+    mod = _import_fresh("test_change_enum_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Enum member selection change must cause miss"
+
+
+def test_enum_member_value_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Editing the captured enum member's value invalidates the stage."""
+    helpers_py = module_dir / "test_change_enumval_helpers.py"
+    template = "import enum\n\nclass Basis(enum.Enum):\n    FRONTIER = {value!r}\n\nDEFAULT = Basis.FRONTIER\n"
+    helpers_py.write_text(template.format(value="frontier"))
+
+    stage_py = module_dir / "test_change_enumval_stage.py"
+    stage_py.write_text(
+        "from test_change_enumval_helpers import DEFAULT\n\ndef stage():\n    return DEFAULT.value\n"
+    )
+
+    mod = _import_fresh("test_change_enumval_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    helpers_py.write_text(template.format(value="front"))
+    _import_fresh("test_change_enumval_helpers")
+    mod = _import_fresh("test_change_enumval_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Enum member value change must cause miss"
+
+
+def test_tuple_constant_content_change_causes_miss(module_dir: pathlib.Path) -> None:
+    """Editing a captured primitive-tuple constant invalidates the stage."""
+    helpers_py = module_dir / "test_change_tuple_helpers.py"
+    helpers_py.write_text('CONDITIONS = ("frontier", "hidden")\n')
+
+    stage_py = module_dir / "test_change_tuple_stage.py"
+    stage_py.write_text(
+        "from test_change_tuple_helpers import CONDITIONS\n\ndef stage():\n    return len(CONDITIONS)\n"
+    )
+
+    mod = _import_fresh("test_change_tuple_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "const:CONDITIONS" in fp1, "Primitive tuple constant should be content-hashed"
+
+    # Same length, different value (and different source size to defeat .pyc mtime cache).
+    helpers_py.write_text('CONDITIONS = ("frontier", "visible")\n')
+    _import_fresh("test_change_tuple_helpers")
+    mod = _import_fresh("test_change_tuple_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1 != fp2, "Primitive tuple constant content change must cause miss"

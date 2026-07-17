@@ -11,7 +11,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
-- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (data class methods, dynamic name access)
+- **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (mutable captures, dynamic name access) and immutable captures (frozen dataclasses, enums, tuples)
 
 ---
 
@@ -58,13 +58,16 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Global constant (int, float, str, bool, bytes, None) | ✅        | `test_fingerprint.py::test_constant_captured`, `test_fingerprint.py::test_multiple_constants_captured`                              |
 | Global constant change                               | ✅        | `test_change_detection.py::test_global_constant_change_causes_miss`                                                                 |
 | Global collection (list, dict, set) with callables   | ✅        | `test_change_detection.py::test_list_callable_tracking`, `test_change_detection.py::test_dispatch_dict_function_change_causes_miss` |
-| Global collection DATA (non-callable values)          | ❌        | `test_pydantic_defaults.py::test_list_constants_not_captured_as_const`                                                               |
+| Mutable collection DATA (dict/list/set values)        | ❌        | `test_pydantic_defaults.py::test_list_constants_not_captured_as_const`                                                               |
+| Immutable collection DATA (tuple/frozenset of primitives) | ✅    | `test_change_detection.py::test_tuple_constant_content_change_causes_miss` (content-hashed)                                          |
+| Enum member captured as global                        | ✅        | `test_safe_fingerprinting.py::test_enum_member_capture_is_tracked`, `test_change_detection.py::test_enum_member_selection_change_causes_miss`, `test_change_detection.py::test_enum_member_value_change_causes_miss` |
 | Pydantic schema hash (model_json_schema)              | ✅        | `test_pydantic_defaults.py::test_pydantic_default_data_captured`                                                                     |
 | Pydantic class in type hint                           | ✅        | `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`                                                             |
 | Global class instance                                | ✅        | `test_change_detection.py::test_class_instance_tracked`, `test_change_detection.py::test_class_instance_change_causes_miss`         |
 | Class definition change                              | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss`                                                                |
 | Class method change                                  | ✅        | `test_change_detection.py::test_class_definition_change_causes_miss` (class AST includes methods)                                   |
-| Data class with user-defined methods                 | ✅ (error) | `test_fingerprint.py::test_check_data_class_methods_rejects_user_methods`                                                          |
+| Data class (or class) with user-defined methods      | ✅        | `test_fingerprint.py::test_data_class_with_methods_is_fingerprinted` (methods fingerprinted; transitive deps followed)             |
+| Method's transitive dependency change                | ✅        | `test_change_detection.py::test_dataclass_method_transitive_dependency_change_causes_miss`                                          |
 | Class base/field annotation dependencies             | ✅        | `test_fingerprint.py::test_process_class_body_dependencies_tracks_bases_and_annotations`                                            |
 | StageParams `@property` method change                | ✅        | `test_change_detection.py::test_stageparams_property_change_causes_miss`                                                            |
 | StageParams regular method change                    | ✅        | `test_change_detection.py::test_stageparams_method_change_causes_miss`                                                              |
@@ -280,7 +283,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 5. **Lazy imports not tracked**: Imports inside function bodies are not detected. Recommended pattern: use module-level imports.
 
-6. **Collection callable tracking**: Callables inside global collections (list, dict, set, tuple, frozenset) are detected and hashed. Only callables are tracked (not data values) to avoid sensitivity to mutable runtime state. Dict keys are sorted alphabetically for deterministic ordering; sets are also sorted.
+6. **Collection callable tracking**: Callables inside global collections (list, dict, set, tuple, frozenset) are detected and hashed. Dict keys are sorted alphabetically for deterministic ordering; sets are also sorted. For DATA (non-callable values): immutable collections (tuple, frozenset) containing only primitives are additionally content-hashed (JSON-serialized), matching qualified module-attribute access; mutable collections (dict, list, set) are NOT content-hashed to avoid sensitivity to mutable runtime state (and captured mutable collections still trigger `_check_mutable_capture`).
 
 7. **Bytecode fallback uses marshal**: When source code is unavailable, `marshal.dumps(func.__code__)` captures the full code object including constants. This ensures that `return x + 1` and `return x + 999` produce different hashes (raw bytecode alone doesn't include constants).
 
@@ -342,7 +345,11 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_fingerprint.py::test_is_user_code_pivot_is_framework`
 
-22. **Unrecognized closure values hashed via `repr()` with guards**: Values in closures that don't match known types (callables, modules, primitives, collections, class instances) are hashed using `repr()` if the repr is deterministic (no `0x` memory addresses) and small (< 10KB). This catches datetime objects, regex patterns, enum values, etc. Non-deterministic or oversized reprs fall back to `_check_mutable_capture`.
+22. **Unrecognized closure values hashed via `repr()` with guards**: Values in closures that don't match known types (callables, modules, primitives, collections, enums, class instances) are hashed using `repr()` if the repr is deterministic (no `0x` memory addresses) and small (< 10KB). This catches datetime objects, regex patterns, etc. Non-deterministic or oversized reprs fall back to `_check_mutable_capture`.
+
+23. **Enum members tracked as immutable**: An enum member captured as a global (bare `from mod import MEMBER` or qualified `mod.MEMBER`) is tracked by its class-qualified name (`enum:NAME` = `EnumClass.MEMBER`), and its enum class source is hashed (via `class:NAME.__class__`) so edits to member values are detected too. Enum members are treated as immutable-by-convention, like frozen dataclasses — repointing a constant to another member or editing a member's value both invalidate the stage.
+
+24. **Class/data-class methods are fingerprinted**: Methods defined on a class (including data classes) are walked as callables (`method:Class.name`), so their transitive dependencies (helper functions/constants they call) invalidate dependents — the same guarantee standalone functions get. Data classes may therefore carry methods; classmethods, staticmethods, and properties are unwrapped to their underlying function.
 
     Tests: `test_fingerprint.py::test_hash_unrecognized_closure_value_deterministic_repr`, `test_fingerprint.py::test_hash_unrecognized_closure_value_memory_address_raises`, `test_fingerprint.py::test_fingerprint_captures_unrecognized_closure_value`
 

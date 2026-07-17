@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import contextvars
 import dataclasses
+import enum
 import functools
 import inspect
 import json
@@ -640,6 +641,26 @@ def _process_class_body_dependencies(
         if hasattr(resolved, "model_fields"):
             _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", resolved), manifest, visited)
 
+    _process_class_methods(cls, manifest, visited)
+
+
+def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
+    """Fingerprint methods defined on a class so their transitive deps are followed.
+
+    The class AST hash (via `_add_callable_to_manifest`) already captures textual edits
+    to method bodies, but NOT the helpers/constants a method calls. Walk each method as a
+    callable so changes to what it depends on invalidate the stage too — the same guarantee
+    standalone functions get. This is why data classes may carry methods without breaking
+    change detection.
+    """
+    for name, member in vars(cls).items():
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        # Unwrap classmethod/staticmethod (.__func__) and property (.fget) to the raw function.
+        func: Any = getattr(member, "__func__", None) or getattr(member, "fget", None) or member
+        if callable(func) and is_user_code(func):
+            _add_callable_to_manifest(f"method:{cls.__name__}.{name}", func, manifest, visited)
+
 
 def _collect_annotation_names(
     node: ast.AST, names: set[str], dotted_refs: list[tuple[str, ...]]
@@ -774,23 +795,6 @@ def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
     raise exceptions.StageDefinitionError(message)
 
 
-def _check_data_class_methods(cls: type) -> None:
-    allowed = frozenset({"model_post_init", "model_validate", "model_rebuild"})
-    user_methods = [
-        name
-        for name, val in vars(cls).items()
-        if callable(val)
-        and not (name.startswith("__") and name.endswith("__"))
-        and name not in allowed
-    ]
-    if user_methods:
-        message = (
-            f"Data class '{cls.__qualname__}' has methods {user_methods}. "
-            + "Move these to standalone functions for reliable change detection."
-        )
-        raise exceptions.StageDefinitionError(message)
-
-
 def _is_frozen_dataclass(value: Any) -> bool:
     if not dataclasses.is_dataclass(value):
         return False
@@ -860,11 +864,25 @@ def _process_closure_values(
             _process_module_dependency(name, value, func, manifest, visited)
         elif isinstance(value, logging.Logger):
             continue
+        elif isinstance(value, enum.Enum):
+            # Enum members are immutable-by-convention, like the frozen dataclasses handled
+            # below. Track WHICH member is captured (the name) and hash the enum class source
+            # (its member values/definitions) via _process_instance_dependency.
+            manifest[f"enum:{name}"] = f"{type(value).__qualname__}.{value.name}"
+            _process_instance_dependency(name, value, manifest, visited)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
             if isinstance(value, (dict, list, set)):
                 _check_mutable_capture(name, value, stage_name)
+            elif _is_primitive_collection(cast("object", value)):
+                # Immutable collections (tuple/frozenset) of primitives are safe to hash by
+                # content, matching qualified module access (_process_module_dependency).
+                # Non-primitive tuples fall through to callable-only tracking below, since
+                # their contents may be mutable.
+                manifest[f"const:{name}"] = xxhash.xxh64(
+                    _serialize_value_for_hash(value).encode()
+                ).hexdigest()
             _process_collection_dependency(
                 name,
                 cast(
@@ -1008,8 +1026,6 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
 
     if not is_user_code(hint_type):
         return
-    if dataclasses.is_dataclass(hint_type):
-        _check_data_class_methods(hint_type)
 
     key = f"class:{hint_type.__name__}"
     if key not in manifest:
@@ -1248,6 +1264,10 @@ def _process_module_dependency(
             continue
         if callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
+        elif isinstance(attr_value, enum.Enum):
+            # Track the member name; hash the enum class source for its values/definitions.
+            manifest[key] = f"{type(attr_value).__qualname__}.{attr_value.name}"
+            _add_callable_to_manifest(f"{key}.__class__", type(attr_value), manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
         elif _is_primitive_collection(attr_value):
@@ -1255,7 +1275,7 @@ def _process_module_dependency(
             manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
         else:
             raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, or collections of primitives."
+                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, enums, or collections of primitives."
             )
 
 
