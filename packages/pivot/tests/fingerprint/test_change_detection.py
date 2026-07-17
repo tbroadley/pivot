@@ -1184,7 +1184,9 @@ def test_dispatch_dict_enum_value_change_causes_miss(
 
     mod = _import_fresh("test_dispatch_enum_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert fp1["enum:DISPATCH['a']"] == "Basis.FRONTIER", "Dict-valued enum member should be tracked"
+    assert fp1["enum:DISPATCH['a']"] == "Basis.FRONTIER", (
+        "Dict-valued enum member should be tracked"
+    )
 
     helpers_py.write_text(template.format(value="frontier_v2"))
     _import_fresh("test_dispatch_enum_helpers")
