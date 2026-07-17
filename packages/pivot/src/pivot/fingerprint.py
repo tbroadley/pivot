@@ -1464,6 +1464,8 @@ def _process_module_dependency(
     if not is_user_code(module):
         return
 
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+
     _t = metrics.start()
     attrs = ast_utils.extract_module_attr_usage(func)
     metrics.end("fingerprint.extract_module_attr_usage", _t)
@@ -1489,12 +1491,30 @@ def _process_module_dependency(
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
-        elif _is_primitive_collection(attr_value):
-            value_str = _serialize_value_for_hash(attr_value)
-            manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
+        elif isinstance(attr_value, (dict, list, set, tuple, frozenset)):
+            # Apply the SAME strictness as the closure-capture path: a `mod.ATTR` collection
+            # is just a module-namespace entry, equally mutable at runtime as a same-module
+            # global, so it must not be treated as "more constant". Bare dict/list/set trigger
+            # `_check_mutable_capture`; tuple/frozenset that nest mutable state or an
+            # unsupported element trigger `_check_immutable_collection_capture`; pure-primitive
+            # immutable collections are content-hashed. Both honor `unsafe_fingerprinting`.
+            attr_ref = f"{mod_name}.{attr_name}"
+            collection = cast(
+                "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
+                attr_value,
+            )
+            if isinstance(attr_value, (dict, list, set)):
+                _check_mutable_capture(attr_ref, collection, stage_name)
+            else:
+                _check_immutable_collection_capture(attr_ref, collection, stage_name)
+                if _is_primitive_collection(cast("object", attr_value)):
+                    manifest[key] = xxhash.xxh64(
+                        _serialize_value_for_hash(attr_value).encode()
+                    ).hexdigest()
+            _process_collection_dependency(attr_ref, collection, manifest, visited)
         else:
             raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, enums, or collections of primitives."
+                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, enums, or collections."
             )
 
 

@@ -224,12 +224,12 @@ def test_different_builtin_factories_have_different_hashes():
 
 @pytest.mark.slow
 def test_primitive_collection_deterministic_across_processes(tmp_path: pathlib.Path) -> None:
-    """Module-level primitive collections have stable hashes across processes."""
-    # Create a module with primitive collections
+    """Module-level immutable primitive collections have stable hashes across processes."""
+    # Create a module with immutable primitive collections
     module_file = tmp_path / "constants.py"
     module_file.write_text("""\
-AGENTS = {"agent1": "config1", "agent2": "config2"}
-NESTED = {"key": [1, 2, {"inner": "value"}]}
+AGENTS = (("agent1", "config1"), ("agent2", "config2"))
+NESTED = ("key", (1, 2, ("inner", "value")))
 """)
 
     script = f"""\

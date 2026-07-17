@@ -108,7 +108,10 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Transitive dependency change        | ✅        | `test_change_detection.py::test_transitive_dependency_change_causes_miss`               |
 | Module constant                     | ✅        | `test_integration.py::test_constant_via_module_attr_captured`                           |
 | Module constant captured            | ✅        | `test_change_detection.py::test_module_constant_captured_via_module_attr`               |
-| Module primitive collection         | ✅        | `test_integration.py::test_primitive_collection_module_attr_fingerprinting`             |
+| Module immutable primitive collection (tuple/frozenset) | ✅ | `test_integration.py::test_immutable_primitive_module_collection_fingerprinting`, `test_integration.py::test_immutable_primitive_module_collection_change_detected` (content-hashed) |
+| Module mutable collection (dict/list/set) DATA | ❌ (error) | `test_integration.py::test_mutable_module_collection_raises_error` (rejected via `_check_mutable_capture`, honoring `unsafe_fingerprinting`) |
+| Module tuple/frozenset nesting mutable or instance | ✅ (error) | `test_integration.py::test_nested_mutable_in_module_tuple_raises`, `test_integration.py::test_instance_in_module_tuple_raises` (rejected via `_check_immutable_collection_capture`) |
+| Module tuple/frozenset of callables (dispatch table) | ✅ | `test_integration.py::test_callable_module_tuple_tracks_callables` |
 | Nested attribute (`X.sub.func`)     | ⚠️        | `test_fingerprint.py::test_extract_nested_attr_access` (extracted but not fully tested) |
 | Multiple attrs from same module     | ✅        | `test_fingerprint.py::test_multiple_module_attrs_detected`                              |
 | Both import styles in same stage    | ✅        | `test_integration.py::test_both_import_styles_in_same_stage`                            |
@@ -339,9 +342,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_determinism.py::test_builtin_default_factory_deterministic_across_processes`, `test_determinism.py::test_builtin_type_deterministic`
 
-19. **Module attribute primitive collections ARE tracked**: Module-level collections (dict, list, tuple, set, frozenset) containing only primitive values (bool, int, float, str, bytes, None) are fingerprinted via JSON serialization. Collections containing non-primitives (custom objects, class instances, numpy arrays) raise a `TypeError` to prevent non-deterministic `repr()` output. The primitive check is recursive, so nested structures like `{"key": [1, 2, {"inner": "value"}]}` are supported.
+19. **Module attribute collections use the SAME strictness as closure capture**: A collection reached as `mod.ATTR` is just a module-namespace entry — equally mutable at runtime as a same-module global — so it is treated identically to a captured global rather than as "more constant". A bare `dict`/`list`/`set` triggers `_check_mutable_capture` (error by default, warn under `unsafe_fingerprinting`) instead of being silently content-hashed. An immutable `tuple`/`frozenset` of primitives is content-hashed via the type-tagged canonical encoding; one that nests a mutable collection or holds a non-primitive/non-callable element (e.g. a class instance) is rejected via `_check_immutable_collection_capture` (honoring `unsafe_fingerprinting`); a tuple/frozenset of callables (dispatch table) tracks each callable. Non-collection unsupported types (bare instances) still raise a `TypeError`. Previously the module path unconditionally content-hashed any `_is_primitive_collection` value (including bare mutable collections and tuples nesting mutable lists) and raised a bare `TypeError` for everything else, diverging from the closure path.
 
-    Tests: `test_integration.py::test_primitive_collection_module_attr_fingerprinting`, `test_integration.py::test_unsupported_module_attr_type_raises_error`
+    Tests: `test_integration.py::test_immutable_primitive_module_collection_fingerprinting`, `test_integration.py::test_mutable_module_collection_raises_error`, `test_integration.py::test_nested_mutable_in_module_tuple_raises`, `test_integration.py::test_instance_in_module_tuple_raises`, `test_integration.py::test_callable_module_tuple_tracks_callables`
 
 20. **Manifest cache invalidation is path-scoped**: Watch-mode reloads invalidate only the cached manifests whose source maps include changed paths, leaving unaffected stage manifests intact. Affected stages are recomputed on next fingerprint access and re-cached.
 
