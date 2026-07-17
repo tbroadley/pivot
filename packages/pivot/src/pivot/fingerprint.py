@@ -737,13 +737,16 @@ def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int
     (getter/setter/deleter), functools.cached_property, and user-authored behavioral
     dunders (see `_FINGERPRINTED_DUNDERS`).
     """
+    # Module-qualify the class so same-named classes from different modules (Config, Params,
+    # …) don't collide on one manifest key and silently overwrite each other's method hashes.
+    class_id = f"{cls.__module__}.{cls.__qualname__}"
     for name, member in vars(cls).items():
         if name.startswith("__") and name.endswith("__") and name not in _FINGERPRINTED_DUNDERS:
             continue
         for suffix, func in _member_functions(member):
             if callable(func) and is_user_code(func):
                 _add_callable_to_manifest(
-                    f"method:{cls.__name__}.{name}{suffix}", func, manifest, visited
+                    f"method:{class_id}.{name}{suffix}", func, manifest, visited
                 )
 
 

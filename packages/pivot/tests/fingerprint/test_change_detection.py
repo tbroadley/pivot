@@ -1022,7 +1022,9 @@ def test_dataclass_method_transitive_dependency_change_causes_miss(
 
     mod = _import_fresh("test_change_dcmethod_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "method:Cfg.compute" in fp1, "Data class method should be fingerprinted"
+    assert any(k.startswith("method:") and k.endswith(".Cfg.compute") for k in fp1), (
+        "Data class method should be fingerprinted"
+    )
     assert "func:dep" in fp1, "Method's transitive dependency should be followed"
 
     helpers_py.write_text(template.format(n=999))
@@ -1267,7 +1269,9 @@ def test_cached_property_transitive_dependency_change_causes_miss(module_dir: pa
 
     mod = _import_fresh("test_change_cachedprop_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "method:Cfg.computed" in fp1, "cached_property should be fingerprinted"
+    assert any(k.startswith("method:") and k.endswith(".Cfg.computed") for k in fp1), (
+        "cached_property should be fingerprinted"
+    )
     assert "func:dep" in fp1, "cached_property's transitive dependency should be followed"
 
     helpers_py.write_text(template.format(n=999))
@@ -1299,7 +1303,9 @@ def test_property_setter_transitive_dependency_change_causes_miss(module_dir: pa
 
     mod = _import_fresh("test_change_setter_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "method:Cfg.value.setter" in fp1, "Property setter should be fingerprinted"
+    assert any(k.startswith("method:") and k.endswith(".Cfg.value.setter") for k in fp1), (
+        "Property setter should be fingerprinted"
+    )
     assert "func:validate" in fp1, "Setter's transitive dependency should be followed"
 
     helpers_py.write_text(template.format(n=999))
@@ -1328,7 +1334,9 @@ def test_dunder_call_transitive_dependency_change_causes_miss(module_dir: pathli
 
     mod = _import_fresh("test_change_dunder_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "method:Adder.__call__" in fp1, "User-authored __call__ should be fingerprinted"
+    assert any(k.startswith("method:") and k.endswith(".Adder.__call__") for k in fp1), (
+        "User-authored __call__ should be fingerprinted"
+    )
     assert "func:dep" in fp1, "__call__'s transitive dependency should be followed"
 
     helpers_py.write_text(template.format(n=999))

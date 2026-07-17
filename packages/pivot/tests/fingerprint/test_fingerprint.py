@@ -1122,9 +1122,10 @@ def test_hash_function_no_code_object():
 def test_data_class_with_methods_is_fingerprinted():
     """Data classes may carry methods: they're fingerprinted, not rejected."""
     manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dataclass_with_method)
-    assert "method:_HelperDataClassWithMethod.custom" in manifest, (
-        "Method should be fingerprinted as a dependency"
-    )
+    assert any(
+        k.startswith("method:") and k.endswith("._HelperDataClassWithMethod.custom")
+        for k in manifest
+    ), "Method should be fingerprinted as a dependency"
     assert "func:_helper_dataclass_method_dep" in manifest, (
         "Method's transitive dependency should be followed"
     )
@@ -3210,10 +3211,12 @@ def _helper_stage_uses_dunder_dataclass(cfg: _HelperDunderDataClass) -> int:
 def test_only_authored_dunders_are_fingerprinted():
     """User-authored __post_init__ is walked; dataclass-generated dunders are not."""
     manifest = fingerprint.get_stage_fingerprint(_helper_stage_uses_dunder_dataclass)
-    assert "method:_HelperDunderDataClass.__post_init__" in manifest, (
-        "User-authored __post_init__ should be fingerprinted"
-    )
+    assert any(
+        k.startswith("method:") and k.endswith("._HelperDunderDataClass.__post_init__")
+        for k in manifest
+    ), "User-authored __post_init__ should be fingerprinted"
     for generated in ("__init__", "__eq__", "__lt__", "__hash__", "__repr__"):
-        assert f"method:_HelperDunderDataClass.{generated}" not in manifest, (
-            f"Generated {generated} should not be walked"
-        )
+        assert not any(
+            k.startswith("method:") and k.endswith(f"._HelperDunderDataClass.{generated}")
+            for k in manifest
+        ), f"Generated {generated} should not be walked"
