@@ -51,6 +51,24 @@ class Basis(enum.Enum):
 ENUM_MEMBER = Basis.FRONTIER
 
 
+class CallableBasis(enum.Enum):
+    A = 1
+    B = 2
+
+    def __call__(self) -> int:
+        return self.value
+
+
+CALLABLE_ENUM_MEMBER = CallableBasis.A
+
+
+class ComplexValueBasis(enum.Enum):
+    A = object()
+
+
+COMPLEX_ENUM_MEMBER = ComplexValueBasis.A
+
+
 def _callable_helper() -> int:
     return 7
 
@@ -97,6 +115,14 @@ def _stage_uses_primitive() -> int:
 
 def _stage_uses_enum_member() -> str:
     return ENUM_MEMBER.value
+
+
+def _stage_uses_callable_enum_member() -> int:
+    return CALLABLE_ENUM_MEMBER()
+
+
+def _stage_uses_complex_enum_member() -> object:
+    return COMPLEX_ENUM_MEMBER.value
 
 
 def _stage_uses_callable() -> int:
@@ -175,6 +201,23 @@ def test_enum_member_capture_is_tracked() -> None:
     assert manifest["enum:ENUM_MEMBER"] == "Basis.FRONTIER", (
         "Captured enum member should be tracked by class-qualified name"
     )
+
+
+def test_callable_enum_member_capture_is_tracked() -> None:
+    """An enum member is tracked via the enum path even when the enum defines __call__."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_enum_member)
+    assert manifest["enum:CALLABLE_ENUM_MEMBER"] == "CallableBasis.A", (
+        "Callable enum member must be tracked by name, not id()-hashed as a callable"
+    )
+    assert "func:CALLABLE_ENUM_MEMBER" not in manifest, (
+        "Callable enum member must not fall through to the callable branch"
+    )
+
+
+def test_enum_member_with_unencodable_value_raises() -> None:
+    """An enum whose value can't be soundly encoded errors instead of silently under-tracking."""
+    with pytest.raises(exceptions.StageDefinitionError, match="cannot be soundly fingerprinted"):
+        fingerprint.get_stage_fingerprint(_stage_uses_complex_enum_member)
 
 
 def test_unsafe_env_allows_mutable_capture(

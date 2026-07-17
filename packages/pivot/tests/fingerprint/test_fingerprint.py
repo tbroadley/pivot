@@ -3153,3 +3153,39 @@ def invalidate_stage():
             fingerprint._state_db.close()
         fingerprint._state_db = None
         fingerprint._state_db_init_attempted = False
+
+
+def test_is_primitive_collection_allows_shared_subcollection():
+    """A collection referencing the same inner collection twice is not a false cycle."""
+    inner = (1, 2)
+    assert fingerprint._is_primitive_collection((inner, inner)) is True
+    assert fingerprint._is_primitive_collection({"a": inner, "b": inner}) is True
+    assert fingerprint._is_primitive_collection((frozenset({1, 2}), frozenset({1, 2}))) is True
+
+
+def test_is_primitive_collection_detects_genuine_cycle():
+    """A collection that transitively contains itself is still rejected."""
+    cyclic: list[object] = [1, 2]
+    cyclic.append(cyclic)
+    assert fingerprint._is_primitive_collection(cyclic) is False
+
+
+def test_serialize_value_for_hash_sorts_nested_frozenset():
+    """A frozenset nested inside a tuple is canonicalized (sorted), not str()-ed."""
+    result = fingerprint._serialize_value_for_hash((frozenset({"c", "a", "b"}),))
+    assert "frozenset" not in result
+    assert result == json.dumps([["a", "b", "c"]])
+
+
+def test_serialize_value_for_hash_nested_set_order_independent():
+    """Nested sets built in different insertion orders serialize identically."""
+    a = fingerprint._serialize_value_for_hash(({3, 1, 2}, "x"))
+    b = fingerprint._serialize_value_for_hash(({2, 3, 1}, "x"))
+    assert a == b
+
+
+def test_serialize_value_for_hash_frozenset_in_dict():
+    """A frozenset nested inside a dict value is canonicalized."""
+    result = fingerprint._serialize_value_for_hash({"k": frozenset({2, 1})})
+    assert "frozenset" not in result
+    assert result == json.dumps({"k": [1, 2]}, sort_keys=True)

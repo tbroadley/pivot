@@ -644,6 +644,32 @@ def _process_class_body_dependencies(
     _process_class_methods(cls, manifest, visited)
 
 
+def _member_functions(member: Any) -> list[tuple[str, Any]]:
+    """Return the underlying (key-suffix, function) pairs a class member wraps.
+
+    A plain method, classmethod, or staticmethod yields one function under the "" suffix
+    (so its manifest key is unchanged). A property yields its getter (""), and any setter
+    (".setter") and deleter (".deleter") under distinct suffixes. A functools.cached_property
+    yields its wrapped function. Each accessor gets its own key so that a helper used only
+    by, say, a setter still invalidates the stage when it changes.
+    """
+    if isinstance(member, property):
+        return [
+            (suffix, fn)
+            for suffix, fn in (
+                ("", member.fget),
+                (".setter", member.fset),
+                (".deleter", member.fdel),
+            )
+            if fn is not None
+        ]
+    if isinstance(member, functools.cached_property):
+        return [("", cast("Any", member.func))]
+    # Unwrap classmethod/staticmethod (.__func__) to the raw function; else the member itself.
+    unwrapped = getattr(member, "__func__", None)
+    return [("", unwrapped if unwrapped is not None else member)]
+
+
 def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
     """Fingerprint methods defined on a class so their transitive deps are followed.
 
@@ -651,15 +677,17 @@ def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int
     to method bodies, but NOT the helpers/constants a method calls. Walk each method as a
     callable so changes to what it depends on invalidate the stage too — the same guarantee
     standalone functions get. This is why data classes may carry methods without breaking
-    change detection.
+    change detection. Covers plain methods, classmethods, staticmethods, properties
+    (getter/setter/deleter), and functools.cached_property.
     """
     for name, member in vars(cls).items():
         if name.startswith("__") and name.endswith("__"):
             continue
-        # Unwrap classmethod/staticmethod (.__func__) and property (.fget) to the raw function.
-        func: Any = getattr(member, "__func__", None) or getattr(member, "fget", None) or member
-        if callable(func) and is_user_code(func):
-            _add_callable_to_manifest(f"method:{cls.__name__}.{name}", func, manifest, visited)
+        for suffix, func in _member_functions(member):
+            if callable(func) and is_user_code(func):
+                _add_callable_to_manifest(
+                    f"method:{cls.__name__}.{name}{suffix}", func, manifest, visited
+                )
 
 
 def _collect_annotation_names(
@@ -852,6 +880,12 @@ def _process_closure_values(
             _process_partial_dependency(
                 name, cast("functools.partial[Any]", value), manifest, visited
             )
+        elif isinstance(value, enum.Enum):
+            # Enum members are immutable-by-convention, like the frozen dataclasses handled
+            # below. This MUST come before the callable branches: an enum defining __call__
+            # makes its members callable, which would otherwise route them to id()-based
+            # fallback hashing.
+            _process_enum_dependency(f"enum:{name}", value, manifest, visited)
         elif callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif callable(value):
@@ -864,12 +898,6 @@ def _process_closure_values(
             _process_module_dependency(name, value, func, manifest, visited)
         elif isinstance(value, logging.Logger):
             continue
-        elif isinstance(value, enum.Enum):
-            # Enum members are immutable-by-convention, like the frozen dataclasses handled
-            # below. Track WHICH member is captured (the name) and hash the enum class source
-            # (its member values/definitions) via _process_instance_dependency.
-            manifest[f"enum:{name}"] = f"{type(value).__qualname__}.{value.name}"
-            _process_instance_dependency(name, value, manifest, visited)
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
             manifest[f"const:{name}"] = repr(value)
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
@@ -945,6 +973,53 @@ def _process_instance_dependency(
     """Track the class definition of a user-defined instance."""
     cls = cast("type[Any]", type(instance))
     _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+
+
+def _encode_enum_member_value(cls: type, member: enum.Enum) -> str:
+    """Canonically encode an enum member's value for fingerprinting.
+
+    `repr` distinguishes types for primitives (e.g. bytes `b'a'` vs str `"b'a'"`); primitive
+    collections are content-hashed. A value that cannot be soundly encoded raises, per the
+    strict error policy — silently ignoring it would let a value change go undetected.
+    """
+    value = member.value
+    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return repr(value)
+    if _is_primitive_collection(value):
+        return xxhash.xxh64(_serialize_value_for_hash(value).encode()).hexdigest()
+    message = (
+        f"Enum member '{cls.__qualname__}.{member.name}' has a value of type "
+        f"'{type(value).__name__}', which cannot be soundly fingerprinted. Use a primitive "
+        "or a collection of primitives as the enum value."
+    )
+    raise exceptions.StageDefinitionError(message)
+
+
+def _enum_class_has_source(cls: type) -> bool:
+    """Whether the enum class has retrievable source (False for functionally-created enums)."""
+    try:
+        inspect.getsource(cls)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
+def _process_enum_dependency(
+    key: str, member: enum.Enum, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Track a captured enum member: its identity, its value, and its class's methods.
+
+    Recording the value (not just the member name) catches value edits the class AST misses:
+    values computed from other globals, IntFlag/Flag pseudo-members (whose `.name` is None),
+    and functionally-created enums. The class definition is walked for method transitive deps
+    only when it has source — a source-less functional enum would otherwise fall back to an
+    id()-based, cross-process-unstable hash.
+    """
+    cls = type(member)
+    manifest[key] = f"{cls.__qualname__}.{member.name}"
+    manifest[f"{key}.value"] = _encode_enum_member_value(cls, member)
+    if _enum_class_has_source(cls):
+        _add_callable_to_manifest(f"{key}.__class__", cls, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -1130,30 +1205,31 @@ def _discover_pydantic_field_types(
             )
 
 
+def _canonicalize_for_hash(value: Any) -> Any:
+    """Recursively convert a value into a JSON-serializable, order-stable form.
+
+    Sets and frozensets are sorted at every depth — not just the top level — so that a
+    set/frozenset nested inside a list, tuple, or dict does not reach `json.dumps`'s
+    `default=str` fallback, whose `str(frozenset)` output depends on `PYTHONHASHSEED` and
+    thus varies across processes. Tuples become lists so `(1, 2)` serializes identically
+    regardless of nesting.
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_for_hash(item) for item in cast("list[Any]", value)]
+    if isinstance(value, (set, frozenset)):
+        canon = [_canonicalize_for_hash(item) for item in cast("set[Any]", value)]
+        return sorted(canon, key=lambda x: json.dumps(x, sort_keys=True, default=str))
+    if isinstance(value, dict):
+        return {k: _canonicalize_for_hash(v) for k, v in cast("dict[Any, Any]", value).items()}
+    return value
+
+
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
-    if hasattr(value, "model_dump"):
-        return json.dumps(value.model_dump(), sort_keys=True, default=str)
-
-    if isinstance(value, (list, tuple)):
-        items: list[Any] = []
-        for item in cast("list[Any]", value):
-            if hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            else:
-                items.append(item)
-        return json.dumps(items, sort_keys=True, default=str)
-
-    if isinstance(value, (set, frozenset)):
-        # Sort for deterministic ordering
-        items_to_sort = cast("set[Any] | frozenset[Any]", value)
-        return json.dumps(
-            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
-        )
-
-    if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
-
+    if hasattr(value, "model_dump") or isinstance(value, (list, tuple, set, frozenset, dict)):
+        return json.dumps(_canonicalize_for_hash(value), sort_keys=True, default=str)
     return repr(value)
 
 
@@ -1191,32 +1267,35 @@ def _sort_key(value: Any) -> tuple[str, str]:
 def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bool:
     """Check if value is a collection containing only primitives (recursively).
 
-    Uses _seen set to detect circular references and prevent infinite recursion.
-    Circular references return False (not a primitive collection).
+    `_seen` is the set of object ids on the CURRENT recursion path (a stack), used to
+    detect genuine circular references (an object that transitively contains itself) and
+    prevent infinite recursion. Each id is removed once its branch finishes, so a value
+    that merely references the same immutable sub-collection more than once (e.g.
+    `(INNER, INNER)`, or two equal literals CPython folds to one object) is NOT mistaken
+    for a cycle — otherwise its contents would be silently dropped from the fingerprint.
     """
     if isinstance(value, (bool, int, float, str, bytes, type(None))):
         return True
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
         obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
         if _seen is None:
             _seen = set()
         if obj_id in _seen:
-            return False  # Circular reference
+            return False  # Circular reference (object contains itself on this path)
         _seen.add(obj_id)
-        items = cast("list[object] | tuple[object, ...] | set[object] | frozenset[object]", value)
-        return all(_is_primitive_collection(item, _seen) for item in items)
-    if isinstance(value, dict):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves key/value types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items_dict = cast("dict[object, object]", value)
-        return all(
-            _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
-            for k, v in items_dict.items()
-        )
+        try:
+            if isinstance(value, dict):
+                items_dict = cast("dict[object, object]", value)
+                return all(
+                    _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
+                    for k, v in items_dict.items()
+                )
+            items = cast(
+                "list[object] | tuple[object, ...] | set[object] | frozenset[object]", value
+            )
+            return all(_is_primitive_collection(item, _seen) for item in items)
+        finally:
+            _seen.discard(obj_id)
     return False
 
 
@@ -1262,12 +1341,13 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if callable(attr_value) and is_user_code(attr_value):
+        if isinstance(attr_value, enum.Enum):
+            # Track the member identity + value; hash the enum class for methods/definitions.
+            # Must precede the callable branch: enum members are callable when the enum
+            # defines __call__, and callable handling would fall back to id()-based hashing.
+            _process_enum_dependency(key, attr_value, manifest, visited)
+        elif callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
-        elif isinstance(attr_value, enum.Enum):
-            # Track the member name; hash the enum class source for its values/definitions.
-            manifest[key] = f"{type(attr_value).__qualname__}.{attr_value.name}"
-            _add_callable_to_manifest(f"{key}.__class__", type(attr_value), manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
         elif _is_primitive_collection(attr_value):
