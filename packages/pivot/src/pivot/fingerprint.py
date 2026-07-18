@@ -13,6 +13,7 @@ import os
 import pathlib
 import sys
 import textwrap
+import threading
 import types
 import typing
 import weakref
@@ -69,8 +70,9 @@ _STDLIB_PATHS = _init_stdlib_paths()
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
 # while ensuring stale entries are automatically cleaned up when functions are GC'd.
-# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
-# per process (multiprocessing uses separate memory spaces), so this is safe.
+# Note: WeakKeyDictionary (and the other module-level caches below) is not thread-safe.
+# Callers may fingerprint concurrently (e.g. status computes explanations via a
+# ThreadPoolExecutor), so the public entry points are serialized by _fingerprint_lock.
 _hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
     weakref.WeakKeyDictionary()
 )
@@ -112,6 +114,23 @@ _active_source_map: dict[str, tuple[int, int, int]] | None = None
 _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_stage_name", default=None
 )
+
+# The module-level caches above are not thread-safe. A reentrant lock serializes the public
+# fingerprint entry points so concurrent callers (e.g. status's ThreadPoolExecutor) can't
+# corrupt them; the fingerprint work is CPU-bound and fast, and the I/O-bound work callers
+# parallelize (lock-file reads, output hashing) happens outside these functions.
+_fingerprint_lock = threading.RLock()
+
+
+def _synchronized[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """Serialize a fingerprint entry point on _fingerprint_lock (reentrant: nested calls ok)."""
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with _fingerprint_lock:
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _close_state_db() -> None:
@@ -346,6 +365,7 @@ def _manifest_references_paths(raw: bytes, changed_paths: set[str]) -> bool:
     return any(source_path in changed_paths for source_path in sources)
 
 
+@_synchronized
 def invalidate_manifests_for_paths(
     paths: Sequence[str | os.PathLike[str] | pathlib.Path],
 ) -> None:
@@ -395,6 +415,7 @@ def invalidate_manifests_for_paths(
         )
 
 
+@_synchronized
 def get_stage_fingerprint(
     func: Callable[..., Any], visited: set[int] | None = None
 ) -> dict[str, str]:
@@ -419,6 +440,7 @@ def get_stage_fingerprint(
     return result
 
 
+@_synchronized
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
     """Like get_stage_fingerprint, but with manifest-level caching.
 
@@ -801,6 +823,7 @@ def _resolve_dotted_path(parts: tuple[str, ...], ns: dict[str, Any]) -> Any:
     return obj
 
 
+@_synchronized
 def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """Generate fingerprint manifest for a loader instance.
 
@@ -1589,6 +1612,7 @@ def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
     return hasattr(func, "__wrapped__")
 
 
+@_synchronized
 def hash_function_ast(func: Callable[..., Any]) -> str:
     """Hash function AST (ignores whitespace, comments, docstrings).
 
@@ -1761,6 +1785,7 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
     )
 
 
+@_synchronized
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins)."""
     _t = metrics.start()
