@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from pivot.pipeline.pipeline import Pipeline
 
 from pivot import cli, exceptions, executor, loaders, outputs, project
-from pivot.storage import track
+from pivot.executor import core as executor_core
+from pivot.storage import cache, track
 
 
 @pytest.fixture
@@ -150,7 +151,7 @@ def test_run_fails_when_tracked_file_missing(
 def test_run_succeeds_with_hash_mismatch(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
 ) -> None:
-    """Pipeline runs successfully when tracked file hash doesn't match .pvt."""
+    """Pipeline runs successfully when tracked file content no longer matches its .pvt."""
     # Create data file with some content
     data_file = pipeline_dir / "data.csv"
     data_file.write_text("original content")
@@ -164,10 +165,34 @@ def test_run_succeeds_with_hash_mismatch(
 
     register_test_stage(_process_simple, name="process")
 
-    # Should succeed (warning logged but execution continues)
+    # Drift against the pointer is not an error here; the stage still runs on the
+    # workspace content, and skip detection sees the new dep hash.
     results = executor.run(pipeline=test_pipeline)
     assert results["process"]["status"] == "ran"
     assert (pipeline_dir / "output.txt").exists()
+
+
+def test_verify_tracked_files_does_not_read_content(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify_tracked_files checks presence only -- it must not hash tracked content.
+
+    Hashing here cost O(all tracked bytes) on every run, for every .pvt in the project,
+    regardless of which stages were being run. Any hashing call is a regression.
+    """
+    (pipeline_dir / "data.csv").write_text("original content")
+    assert runner.invoke(cli.cli, ["track", "data.csv"]).exit_code == 0
+    (pipeline_dir / "data.csv").write_text("content that hashes differently")
+
+    def _fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("verify_tracked_files must not hash tracked content")
+
+    monkeypatch.setattr(cache, "hash_file", _fail)
+    monkeypatch.setattr(cache, "hash_directory", _fail)
+
+    executor_core.verify_tracked_files(pipeline_dir)
 
 
 # =============================================================================
