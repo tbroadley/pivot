@@ -31,7 +31,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
-_CACHE_SCHEMA_VERSION = 2
+# Bump when the hashing scheme changes, to invalidate cached hashes computed by the
+# old scheme. Version 3: code-object hashes no longer include co_filename.
+_CACHE_SCHEMA_VERSION = 3
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -1571,6 +1573,36 @@ def _process_module_dependency(
             )
 
 
+# Placeholder substituted for co_filename before marshalling code objects. The real
+# filename is an absolute path, which would make bytecode hashes machine-specific.
+_PORTABLE_CO_FILENAME = "<pivot>"
+
+
+def _strip_code_filenames(code: types.CodeType) -> types.CodeType:
+    """Return `code` with all embedded filenames replaced by a fixed placeholder.
+
+    `co_filename` holds the absolute path of the file the code was compiled from,
+    and nested code objects (comprehensions, closures) carry their own copy. Those
+    paths differ between checkouts and between interpreter installs, so they must
+    not reach the hash. Everything else about the code object is preserved.
+    """
+    consts = tuple(
+        _strip_code_filenames(const) if isinstance(const, types.CodeType) else const
+        for const in code.co_consts
+    )
+    return code.replace(co_filename=_PORTABLE_CO_FILENAME, co_consts=consts)
+
+
+def hash_code_object(code: types.CodeType) -> str:
+    """Hash a code object's bytecode, constants and structure, ignoring file paths.
+
+    Used when source-based hashing is unavailable or misleading (wrapped functions,
+    lambdas defined via `exec`, ...). The result is stable across checkouts and
+    machines because filenames are stripped first; see `_strip_code_filenames`.
+    """
+    return xxhash.xxh64(marshal.dumps(_strip_code_filenames(code))).hexdigest()
+
+
 def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
     """Get qualname, disambiguated for lambdas.
 
@@ -1714,7 +1746,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         # __wrapped__ and returns the ORIGINAL function's source, making decorator
         # logic invisible. Use __code__ bytecode to capture the actual wrapper.
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
-            return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+            return hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
         _t_source = metrics.start()
         try:
@@ -1724,7 +1756,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
             if hasattr(func, "__code__"):
                 # marshal.dumps captures full code object including co_consts
                 # (co_code alone doesn't include constants - x+1 and x+999 have same co_code!)
-                return xxhash.xxh64(marshal.dumps(func.__code__)).hexdigest()  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+                return hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
             # KNOWN ISSUE: Using id(func) is non-deterministic across runs
             # This affects lambdas without source code, causing unnecessary re-runs
             if is_user_code(func):

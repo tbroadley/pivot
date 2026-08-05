@@ -9,6 +9,7 @@ This directory contains all tests for Pivot's automatic code change detection (f
 - **`test_change_detection.py`** - Comprehensive change detection behavior tests
 - **`test_pydantic_defaults.py`** - Tests for Pydantic default data tracking
 - **`test_functools.py`** - Tests for `functools.partial` and `functools.wraps` handling
+- **`test_code_hash_portability.py`** - Tests that bytecode hashes ignore source file paths
 - **`test_callback_vulnerabilities.py`** - Tests documenting callback detection edge cases
 - **`test_determinism.py`** - Cross-process fingerprint stability tests (builtins, default_factory)
 - **`test_safe_fingerprinting.py`** - Tests for safe fingerprinting error guards (mutable captures, dynamic name access) and immutable captures (frozen dataclasses, enums, tuples)
@@ -218,6 +219,9 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Multiple runs stable                    | ✅        | `test_change_detection.py::test_multiple_runs_stable`           |
 | Same logic, different names → same hash | ✅        | `test_fingerprint.py::test_identical_functions_same_hash`       |
 | Dict key order doesn't affect hash      | ✅        | `test_change_detection.py::test_fingerprint_ordering_stability` |
+| Wrapped function hash independent of checkout path | ✅ | `test_code_hash_portability.py::test_wrapped_function_hash_independent_of_source_path` |
+| `@contextlib.contextmanager` hash independent of interpreter install | ✅ | `test_code_hash_portability.py::test_contextmanager_hash_independent_of_interpreter_path` |
+| Nested code object paths ignored        | ✅        | `test_code_hash_portability.py::test_hash_ignores_filename_of_nested_code_only` |
 
 ---
 
@@ -298,7 +302,9 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
 6. **Collection callable tracking**: Callables inside global collections (list, dict, set, tuple, frozenset) are detected and hashed. Dict keys are sorted alphabetically for deterministic ordering; sets are also sorted. For DATA (non-callable values): immutable collections (tuple, frozenset) containing only primitives are additionally content-hashed via a **type-tagged** canonical encoding (so `(1, 2)`, `[1, 2]`, and `frozenset({1, 2})` — and dict keys `1` vs `"1"`, `b"1"` vs `"1"` — hash differently, and nested sets/frozensets sort deterministically across processes). Mutable collections (dict, list, set) are NOT content-hashed and captured ones trigger `_check_mutable_capture`. A captured tuple/frozenset that **nests** a mutable collection, or contains an element that isn't a primitive, enum member, frozen dataclass/pydantic instance, callable, or nested tuple/frozenset (e.g. a mutable class instance), is rejected via `_check_immutable_collection_capture` (honoring `unsafe_fingerprinting`) rather than silently under-tracked. Enum members and frozen dataclass/pydantic instances held in a tuple/frozenset are allowed and each is tracked like a standalone capture (enum: identity + value + class source; frozen instance: class source, with field values captured by the collection's content hash) via `_process_collection_dependency`.
 
-7. **Bytecode fallback uses marshal**: When source code is unavailable, `marshal.dumps(func.__code__)` captures the full code object including constants. This ensures that `return x + 1` and `return x + 999` produce different hashes (raw bytecode alone doesn't include constants).
+7. **Bytecode fallback uses marshal, with filenames stripped**: When source code is unavailable, `marshal.dumps(func.__code__)` captures the full code object including constants. This ensures that `return x + 1` and `return x + 999` produce different hashes (raw bytecode alone doesn't include constants). A marshalled code object also embeds `co_filename` — an absolute path — so `fingerprint.hash_code_object()` replaces the filename of the code object and every nested code constant with a fixed placeholder first. Without that, the same code hashes differently in every checkout and under every interpreter install, and lock files are only valid on the machine that wrote them.
+
+    Tests: `test_code_hash_portability.py`
 
 8. **Class definition tracking**: Classes are tracked using the `class:` prefix (e.g., `class:MyProcessor`). The entire class definition is hashed including all methods, class variables, and decorators. Module-level class instances (e.g., `processor = Processor()`) have their class type tracked via `class:varname.__class__`.
 
@@ -316,7 +322,7 @@ When a stage uses `@pivot.no_fingerprint()`, AST fingerprinting is bypassed enti
 
     Tests: `test_pydantic_defaults.py::test_pydantic_default_data_captured`, `test_pydantic_defaults.py::test_pydantic_class_captured_from_type_hint`, `test_pydantic_defaults.py::test_pydantic_default_change_triggers_different_hash`, `test_fingerprint.py::test_recursive_pydantic_model_no_infinite_recursion`
 
-13. **`functools.wraps` / `__wrapped__` ARE tracked**: Functions decorated with `@functools.wraps` are properly fingerprinted using bytecode hashing. Since `inspect.getsource()` follows the `__wrapped__` chain and returns the original function's source, we detect `__wrapped__` and use `marshal.dumps(__code__)` to hash the wrapper's bytecode instead. This correctly captures decorator logic changes while closure analysis still tracks the wrapped function.
+13. **`functools.wraps` / `__wrapped__` ARE tracked**: Functions decorated with `@functools.wraps` are properly fingerprinted using bytecode hashing. Since `inspect.getsource()` follows the `__wrapped__` chain and returns the original function's source, we detect `__wrapped__` and hash the wrapper's bytecode via `hash_code_object()` instead. This correctly captures decorator logic changes while closure analysis still tracks the wrapped function. Note that `@contextlib.contextmanager` applies `functools.wraps` itself, so contextmanager-decorated stages take this path too — with the wrapper's code object coming from contextlib inside the interpreter install.
 
     Tests: `test_functools.py::test_decorator_change_triggers_fingerprint_change`, `test_functools.py::test_wrapped_uses_bytecode_not_source`
 

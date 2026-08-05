@@ -34,6 +34,7 @@ Documented learnings from bugs, design decisions, and implementation patterns. C
 | [Single Underscore Functions ARE Tracked](2026-02-01-single-underscore-functions-are-tracked.md) | 2026-02-01 | `_private` functions are included in fingerprints |
 | [Test Helpers Must Be Module-Level](2026-02-01-test-helpers-must-be-module-level.md) | 2026-02-01 | Fingerprinting requires module-level test helpers |
 | [Skip Detection Invariants](2026-02-08-skip-detection-invariants.md) | 2026-02-08 | Three-tier skip detection algorithm invariants |
+| [Marshalled Code Objects Embed an Absolute Path](2026-08-05-marshalled-code-embeds-absolute-path.md) | 2026-08-05 | `marshal.dumps(__code__)` made wrapped-function hashes machine-specific |
 
 ## Execution & Workers (loky)
 
