@@ -33,9 +33,9 @@ class ImportSource(TypedDict):
     repo: str  # Source repo URL
     rev: str  # Symbolic ref (branch/tag)
     rev_lock: str  # Resolved commit SHA
-    stage: str  # Source stage name (auto-discovered)
     path: str  # Path within source repo
     remote: str  # Source's S3 remote URL
+    stage: NotRequired[str]  # Source stage name; omitted for `pivot track`-ed files
 
 
 class PvtData(TypedDict):
@@ -51,7 +51,8 @@ class PvtData(TypedDict):
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "source"})
-_REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
+_REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "path", "remote"})
+_VALID_SOURCE_KEYS = _REQUIRED_SOURCE_KEYS | {"stage"}
 
 
 def is_pvt_data(data: object) -> TypeGuard[PvtData]:
@@ -70,7 +71,9 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
         source_dict = cast("dict[str, object]", source)
         if not _REQUIRED_SOURCE_KEYS.issubset(source_dict.keys()):
             return False
-        if not all(isinstance(source_dict[k], str) for k in _REQUIRED_SOURCE_KEYS):
+        if not all(k in _VALID_SOURCE_KEYS for k in source_dict):
+            return False
+        if not all(isinstance(source_dict[k], str) for k in source_dict):
             return False
     return True
 

@@ -6,7 +6,7 @@ import contextlib
 import json
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
@@ -412,10 +412,21 @@ async def test_agent_rpc_source_rejects_oversized_messages(tmp_path: Path) -> No
             oversized_request = json.dumps(
                 {"jsonrpc": "2.0", "method": "run", "id": 1, "data": huge_payload}
             )
-            await conn.send(oversized_request.encode() + b"\n")
 
-            # Should receive error response
-            response_line = await conn.receive(4096)
+            # The payload exceeds the OS socket buffer, so send() can't complete in
+            # one shot: the server reads 1MB, replies, then closes the connection
+            # before we finish writing. Send and receive concurrently so we read the
+            # error response regardless of when the server tears down the write side
+            # (which surfaces as BrokenResourceError on small-buffer platforms).
+            async def _send_oversized() -> None:
+                with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
+                    await conn.send(oversized_request.encode() + b"\n")
+
+            response_line = b""
+            async with anyio.create_task_group() as send_tg:
+                send_tg.start_soon(_send_oversized)
+                response_line = await conn.receive(4096)
+
             response = json.loads(response_line.decode())
 
             assert "error" in response, "Should return error for oversized message"
@@ -543,23 +554,13 @@ async def test_rpc_run_invalid_stage_returns_error(
 
 
 @pytest.mark.anyio
-async def test_agent_rpc_source_connection_timeout() -> None:
+async def test_agent_rpc_source_connection_timeout(tmp_path: Path) -> None:
     """AgentRpcSource has timeout protection for idle connections.
 
     Note: This test verifies timeout mechanism exists but uses short timeout
     to avoid slow test execution. Production uses 5 minute timeout.
     """
-    from pathlib import Path
-    from unittest.mock import patch
-
-    import anyio
-
-    from pivot.engine.agent_rpc import AgentRpcSource
-    from pivot.engine.types import InputEvent
-
-    socket_path = Path("/tmp/test_timeout.sock")
-    if socket_path.exists():
-        socket_path.unlink()
+    socket_path = tmp_path / "timeout.sock"
 
     send, recv = anyio.create_memory_object_stream[InputEvent](10)
 

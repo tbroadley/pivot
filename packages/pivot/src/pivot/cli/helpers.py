@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import enum
 import json
+import shutil
 import sys
+import time
 from typing import TYPE_CHECKING, Any, cast, override
 
 import click
@@ -17,6 +19,40 @@ if TYPE_CHECKING:
 
 from pivot import exceptions
 from pivot.cli import decorators as cli_decorators
+
+# Captured at import so byte formatting survives tests that monkeypatch ``async_tqdm``.
+_format_sizeof = async_tqdm.format_sizeof
+
+# Minimum seconds between byte-postfix repaints (a single large file's file-count bar
+# only advances at start/finish, so set_bytes must repaint itself to look live).
+_BYTES_REFRESH_INTERVAL = 0.1
+
+# The filename in a transfer bar's prefix is padded/truncated to a fixed width so the
+# bar itself doesn't jump left and right as files of different name lengths stream by.
+_FILENAME_MIN_WIDTH = 12
+_FILENAME_MAX_WIDTH = 60
+# Rough width of everything after the filename on a transfer line: the percentage, the
+# bar, the count/timing block, and the byte/rate postfix, e.g.
+# "  52%|███| 1088.17/2110 [00:51<01:00, 16.96file/s, 983MB (19.6MB/s)]".
+_TRANSFER_BAR_RESERVED = 58
+
+
+def _fit_filename(filename: str, width: int) -> str:
+    """Pad or truncate ``filename`` to exactly ``width`` columns.
+
+    Keeping the prefix a constant width stops the progress bar from jumping. Long
+    paths keep their tail (the actual file name); the head is elided with a leading
+    ellipsis so the most informative part stays visible.
+    """
+    if len(filename) <= width:
+        return filename.ljust(width)
+    return "…" + filename[-(width - 1) :]
+
+
+def _filename_field_width(columns: int, action: str) -> int:
+    """Width to allot the filename, clamped so the bar always has room to render."""
+    available = columns - len(action) - _TRANSFER_BAR_RESERVED
+    return max(_FILENAME_MIN_WIDTH, min(_FILENAME_MAX_WIDTH, available))
 
 
 class NoPipelineError(exceptions.PivotError):
@@ -122,11 +158,15 @@ class TransferProgress:
     _action: str
     _bar: async_tqdm[Any] | None
     _show: bool
+    _bytes_start: float | None
+    _bytes_last_refresh: float
 
     def __init__(self, action: str, *, quiet: bool = False) -> None:
         self._action = action
         self._bar = None
         self._show = sys.stderr.isatty() and not quiet
+        self._bytes_start = None
+        self._bytes_last_refresh = 0.0
 
     def __enter__(self) -> TransferProgress:
         return self
@@ -140,7 +180,7 @@ class TransferProgress:
         if self._bar is not None:
             self._bar.close()
 
-    def callback(self, completed: int, total: int, filename: str) -> None:
+    def callback(self, completed: float, total: int, filename: str) -> None:
         if not self._show:
             return
         if self._bar is None:
@@ -151,8 +191,31 @@ class TransferProgress:
                 leave=False,
                 unit="file",
             )
-        self._bar.desc = f"{self._action} {filename}"
-        self._bar.update(completed - self._bar.n)
+        width = _filename_field_width(shutil.get_terminal_size().columns, self._action)
+        self._bar.desc = f"{self._action} {_fit_filename(filename, width)}"
+        # Round so a fractional count renders as e.g. "0.50/1" rather than the raw
+        # float; the percentage column carries the precise progress anyway.
+        self._bar.update(round(completed, 2) - self._bar.n)
+
+    def set_bytes(self, bytes_done: int) -> None:
+        """Show cumulative bytes transferred and average rate as the bar postfix."""
+        if not self._show or self._bar is None:
+            return
+        now = time.monotonic()
+        if self._bytes_start is None:
+            self._bytes_start = now
+        size = _format_sizeof(bytes_done)
+        elapsed = now - self._bytes_start
+        if elapsed > 0:
+            rate = _format_sizeof(bytes_done / elapsed)
+            self._bar.set_postfix_str(f"{size}B ({rate}B/s)", refresh=False)
+        else:
+            self._bar.set_postfix_str(f"{size}B", refresh=False)
+        # Repaint on a throttled interval: a single large file only triggers the bar's
+        # own redraw at start/finish, so without this the postfix would never climb.
+        if now - self._bytes_last_refresh >= _BYTES_REFRESH_INTERVAL:
+            self._bytes_last_refresh = now
+            self._bar.refresh()
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

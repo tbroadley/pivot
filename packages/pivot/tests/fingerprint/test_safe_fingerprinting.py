@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -40,6 +41,32 @@ FROZEN_PYDANTIC = FrozenModel(value=1)
 IMMUTABLE_TUPLE = (1, 2)
 IMMUTABLE_FROZENSET = frozenset({1, 2})
 PRIMITIVE_INT = 42
+
+
+class Basis(enum.Enum):
+    FRONTIER = "frontier"
+    HEAD = "head"
+
+
+ENUM_MEMBER = Basis.FRONTIER
+
+
+class CallableBasis(enum.Enum):
+    A = 1
+    B = 2
+
+    def __call__(self) -> int:
+        return self.value
+
+
+CALLABLE_ENUM_MEMBER = CallableBasis.A
+
+
+class ComplexValueBasis(enum.Enum):
+    A = object()
+
+
+COMPLEX_ENUM_MEMBER = ComplexValueBasis.A
 
 
 def _callable_helper() -> int:
@@ -84,6 +111,18 @@ def _stage_uses_frozenset() -> int:
 
 def _stage_uses_primitive() -> int:
     return PRIMITIVE_INT
+
+
+def _stage_uses_enum_member() -> str:
+    return ENUM_MEMBER.value
+
+
+def _stage_uses_callable_enum_member() -> int:
+    return CALLABLE_ENUM_MEMBER()
+
+
+def _stage_uses_complex_enum_member() -> object:
+    return COMPLEX_ENUM_MEMBER.value
 
 
 def _stage_uses_callable() -> int:
@@ -150,10 +189,35 @@ def test_mutable_closure_capture_raises(
         pytest.param(_stage_uses_frozenset, id="frozenset"),
         pytest.param(_stage_uses_primitive, id="primitive"),
         pytest.param(_stage_uses_callable, id="callable"),
+        pytest.param(_stage_uses_enum_member, id="enum-member"),
     ],
 )
-def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], int]) -> None:
+def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], object]) -> None:
     fingerprint.get_stage_fingerprint_cached("train", func)
+
+
+def test_enum_member_capture_is_tracked() -> None:
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_member)
+    assert manifest["enum:ENUM_MEMBER"] == "Basis.FRONTIER", (
+        "Captured enum member should be tracked by class-qualified name"
+    )
+
+
+def test_callable_enum_member_capture_is_tracked() -> None:
+    """An enum member is tracked via the enum path even when the enum defines __call__."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_enum_member)
+    assert manifest["enum:CALLABLE_ENUM_MEMBER"] == "CallableBasis.A", (
+        "Callable enum member must be tracked by name, not id()-hashed as a callable"
+    )
+    assert "func:CALLABLE_ENUM_MEMBER" not in manifest, (
+        "Callable enum member must not fall through to the callable branch"
+    )
+
+
+def test_enum_member_with_unencodable_value_raises() -> None:
+    """An enum whose value can't be soundly encoded errors instead of silently under-tracking."""
+    with pytest.raises(exceptions.StageDefinitionError, match="cannot be soundly fingerprinted"):
+        fingerprint.get_stage_fingerprint(_stage_uses_complex_enum_member)
 
 
 def test_unsafe_env_allows_mutable_capture(
@@ -170,10 +234,45 @@ def test_unsafe_env_allows_mutable_capture(
 
 
 NESTED_MUTABLE_TUPLE = (1, [2, 3])
+INSTANCE_TUPLE = (MutableConfig(1),)
+CALLABLE_TUPLE = (_callable_helper, _callable_helper)
+ENUM_TUPLE = (Basis.FRONTIER, Basis.HEAD)
+ENUM_FROZENSET = frozenset({Basis.FRONTIER})
+FROZEN_DATACLASS_TUPLE = (FrozenConfig(value=1), FrozenConfig(value=2))
+FROZEN_PYDANTIC_TUPLE = (FrozenModel(value=1),)
+NESTED_FROZEN_TUPLE = (("first", FrozenConfig(value=1)), ("second", FrozenConfig(value=2)))
+
+
+def _stage_uses_enum_tuple() -> int:
+    return len(ENUM_TUPLE)
+
+
+def _stage_uses_enum_frozenset() -> int:
+    return len(ENUM_FROZENSET)
+
+
+def _stage_uses_frozen_dataclass_tuple() -> int:
+    return len(FROZEN_DATACLASS_TUPLE)
+
+
+def _stage_uses_frozen_pydantic_tuple() -> int:
+    return len(FROZEN_PYDANTIC_TUPLE)
+
+
+def _stage_uses_nested_frozen_tuple() -> int:
+    return len(NESTED_FROZEN_TUPLE)
 
 
 def _stage_uses_nested_mutable_tuple() -> int:
     return len(NESTED_MUTABLE_TUPLE)
+
+
+def _stage_uses_instance_tuple() -> int:
+    return len(INSTANCE_TUPLE)
+
+
+def _stage_uses_callable_tuple() -> int:
+    return CALLABLE_TUPLE[0]()
 
 
 def _stage_uses_mutable_dict_for_config_test() -> int:
@@ -198,6 +297,58 @@ def test_unsafe_config_allows_mutable_capture(
     ), "Should warn when unsafe fingerprinting via config is enabled"
 
 
-def test_nested_mutable_in_tuple_allows_fingerprint() -> None:
-    """Tuple containing mutable list is allowed — tuples are immutable at top level."""
-    fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+def test_nested_mutable_in_tuple_raises() -> None:
+    """A tuple nesting a mutable list is rejected: its contents can change at runtime."""
+    with pytest.raises(exceptions.StageDefinitionError, match="nests a mutable list"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_nested_mutable_tuple)
+
+
+def test_instance_in_tuple_raises() -> None:
+    """A tuple holding a class instance is rejected rather than silently under-tracked."""
+    with pytest.raises(exceptions.StageDefinitionError, match="element of type 'MutableConfig'"):
+        fingerprint.get_stage_fingerprint_cached("train", _stage_uses_instance_tuple)
+
+
+def test_callable_tuple_allows_fingerprint() -> None:
+    """A tuple of callables (dispatch table) is still allowed; the callables are tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_tuple)
+    assert any(k.startswith("func:CALLABLE_TUPLE[") for k in manifest), (
+        "Callables inside the tuple should be tracked"
+    )
+
+
+def test_enum_tuple_allows_fingerprint_and_tracks_members() -> None:
+    """A tuple of enum members is allowed (like a standalone enum) and each member is tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_tuple)
+    assert "const:ENUM_TUPLE" in manifest, "The tuple itself should be content-hashed"
+    assert manifest["enum:ENUM_TUPLE[0]"] == "Basis.FRONTIER"
+    assert manifest["enum:ENUM_TUPLE[1]"] == "Basis.HEAD"
+
+
+def test_enum_frozenset_allows_fingerprint_and_tracks_members() -> None:
+    """A frozenset of enum members is allowed and its members are tracked by name."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_frozenset)
+    assert "const:ENUM_FROZENSET" in manifest, "The frozenset itself should be content-hashed"
+    assert manifest["enum:ENUM_FROZENSET[0]"] == "Basis.FRONTIER"
+
+
+def test_frozen_dataclass_tuple_allows_fingerprint_and_tracks_class() -> None:
+    """A tuple of frozen dataclass instances is allowed, content-hashed, and its class tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_dataclass_tuple)
+    assert "const:FROZEN_DATACLASS_TUPLE" in manifest, "The tuple should be content-hashed"
+    assert "class:FROZEN_DATACLASS_TUPLE[0].__class__" in manifest, (
+        "Element class should be tracked"
+    )
+
+
+def test_frozen_pydantic_tuple_allows_fingerprint_and_tracks_class() -> None:
+    """A tuple of frozen pydantic instances is allowed, content-hashed, and its class tracked."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_pydantic_tuple)
+    assert "const:FROZEN_PYDANTIC_TUPLE" in manifest, "The tuple should be content-hashed"
+    assert "class:FROZEN_PYDANTIC_TUPLE[0].__class__" in manifest, "Element class should be tracked"
+
+
+def test_nested_frozen_instance_tuple_allows_fingerprint() -> None:
+    """A tuple of (label, frozen-instance) tuples is allowed and content-hashed."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_nested_frozen_tuple)
+    assert "const:NESTED_FROZEN_TUPLE" in manifest, "The nested tuple should be content-hashed"

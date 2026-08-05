@@ -5,6 +5,7 @@ import importlib
 import linecache
 import logging
 import multiprocessing as mp
+import os
 import pathlib
 import subprocess
 import sys
@@ -21,6 +22,14 @@ from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.pipeline import pipeline as pipeline_mod
 from pivot.registry import StageRegistry
+
+# Unix domain socket paths are limited to ~104 bytes on macOS. pytest's default
+# tmp_path lives under $TMPDIR (a long /var/folders/... path on macOS), so .sock
+# files created under tmp_path overflow that limit ("OSError: AF_UNIX path too
+# long"). Redirect pytest's temp root to a short path when the default is too long.
+# The length guard makes this a no-op on Linux (where gettempdir() is just /tmp).
+if "PYTEST_DEBUG_TEMPROOT" not in os.environ and len(tempfile.gettempdir()) > 32:
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = "/tmp"
 
 # Add tests directory to sys.path so helpers.py can be imported
 _tests_dir = pathlib.Path(__file__).parent

@@ -9,7 +9,7 @@ from pivot.cli import checkout as checkout_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import sync as transfer
-from pivot.storage import state
+from pivot.storage import state, track
 from pivot.types import TransferSummary
 
 if TYPE_CHECKING:
@@ -254,31 +254,70 @@ def test_fetch_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Fetch dry run without stages lists all remote files."""
+    """Fetch dry run without targets resolves project-referenced files, not the remote."""
+    referenced_hash = "ab" + "c" * 14
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
+        track.write_pvt_file(
+            pathlib.Path("data.csv.pvt"),
+            track.PvtData(path="data.csv", hash=referenced_hash, size=4),
+        )
 
         mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
             return_value=(mock_remote, "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
         result = runner.invoke(cli.cli, ["fetch", "--dry-run"])
 
         assert result.exit_code == 0
-        assert "Would fetch 2 file(s) from 'origin'" in result.output
+        assert "Would fetch 1 file(s) from 'origin'" in result.output
+        mock_remote.list_hashes.assert_not_called()
+
+
+def test_fetch_dry_run_exclude_drops_matching_paths(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """--exclude removes referenced paths under the pattern from the resolved set."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        pathlib.Path(".pivot").mkdir()
+        pathlib.Path(".git").mkdir()
+        monkeypatch.setattr(project, "_project_root_cache", None)
+
+        track.write_pvt_file(
+            pathlib.Path("public.csv.pvt"),
+            track.PvtData(path="public.csv", hash="ab" + "c" * 14, size=4),
+        )
+        sensitive = pathlib.Path("data/raw/sensitive")
+        sensitive.mkdir(parents=True)
+        track.write_pvt_file(
+            sensitive / "secret.csv.pvt",
+            track.PvtData(path="secret.csv", hash="de" + "f" * 14, size=4),
+        )
+
+        mock_remote = mocker.MagicMock()
+        mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mocker.patch.object(
+            transfer, "create_remote_from_name", return_value=(mock_remote, "origin")
+        )
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
+
+        excluded = runner.invoke(cli.cli, ["fetch", "--dry-run", "--exclude", "data/raw/sensitive"])
+        assert excluded.exit_code == 0
+        assert "Would fetch 1 file(s) from 'origin'" in excluded.output
+
+        plain = runner.invoke(cli.cli, ["fetch", "--dry-run"])
+        assert plain.exit_code == 0
+        assert "Would fetch 2 file(s) from 'origin'" in plain.output
 
 
 def test_fetch_success(
@@ -429,32 +468,31 @@ def test_pull_dry_run_all(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull dry run without stages lists all remote files."""
-
+    """Pull dry run without targets resolves project-referenced files, not the remote."""
+    referenced_hash = "ab" + "c" * 14
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
+        track.write_pvt_file(
+            pathlib.Path("data.csv.pvt"),
+            track.PvtData(path="data.csv", hash=referenced_hash, size=4),
+        )
 
         mock_remote = mocker.MagicMock()
-
-        async def mock_list_hashes() -> set[str]:
-            return {"remote1", "remote2", "remote3"}
-
-        mock_remote.list_hashes = mock_list_hashes
-
         mocker.patch.object(config_mod, "get_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
             return_value=(mock_remote, "origin"),
         )
-        mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"remote1"})
+        mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
         result = runner.invoke(cli.cli, ["pull", "--dry-run", "--all"])
 
         assert result.exit_code == 0
-        assert "Would pull 2 file(s) from 'origin'" in result.output
+        assert "Would pull 1 file(s) from 'origin'" in result.output
+        mock_remote.list_hashes.assert_not_called()
 
 
 def test_pull_success(
@@ -839,16 +877,16 @@ def test_pull_no_pipeline_no_targets_fails_early(
         mock_pull.assert_not_called()
 
 
-def test_pull_defaults_to_only_missing_for_checkout(
+def test_pull_defaults_to_safe_checkout(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull defaults to only_missing=True when neither --force nor --only-missing passed.
+    """Pull passes neither --force nor --only-missing, using checkout's SAFE default.
 
-    When pull invokes checkout without explicit --force or --only-missing flags,
-    it should default to only_missing=True for safety.
+    SAFE updates stale cache-backed files but errors (rather than clobbering) when a
+    file has untracked local changes, so pull never silently loses data.
     """
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
@@ -879,11 +917,11 @@ def test_pull_defaults_to_only_missing_for_checkout(
         result = runner.invoke(cli.cli, ["pull", "output.csv"])
 
         assert result.exit_code == 0, f"Failed: {result.output}"
-        # Verify checkout was called with only_missing=True
         mock_checkout.assert_called_once()
         call_kwargs = mock_checkout.call_args.kwargs
-        assert call_kwargs.get("only_missing") is True, (
-            f"Expected only_missing=True, got {call_kwargs}"
+        assert call_kwargs.get("force") is False, f"Expected force=False, got {call_kwargs}"
+        assert call_kwargs.get("only_missing") is False, (
+            f"Expected only_missing=False (SAFE default), got {call_kwargs}"
         )
 
 

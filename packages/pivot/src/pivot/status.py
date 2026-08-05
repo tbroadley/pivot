@@ -43,6 +43,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import logging
 import pathlib
@@ -65,9 +66,6 @@ from pivot.remote import sync as transfer
 from pivot.storage import cache, track
 from pivot.storage import state as state_mod
 from pivot.types import (
-    CodeChange,
-    DepChange,
-    ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -110,51 +108,103 @@ def _get_explanations_in_parallel(
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
-    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
+    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing).
+
+    Raises:
+        PivotError: If any stage's explanation fails unexpectedly. Such failures
+            indicate a bug or environment problem, not a routine stage state, so
+            they are aggregated and surfaced rather than masquerading as stale
+            explanations (which would corrupt ``--json`` output and mislead users).
+    """
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
     explanations_by_name = dict[str, StageExplanation]()
+    hash_entries_by_state_dir = dict[pathlib.Path, list[tuple[str, int, int, int, str]]]()
+    failures = list[tuple[str, Exception]]()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = dict[Future[StageExplanation], str]()
-        for stage_name in execution_order:
-            stage_info = all_stages[stage_name]
-            fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
-            stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-            future = pool.submit(
-                explain.get_stage_explanation,
-                stage_name,
-                fingerprint,
-                stage_info["deps_paths"],
-                stage_info["outs_paths"],
-                stage_info["params"],
-                overrides,
-                stage_state_dir,
-                force=force,
-                allow_missing=allow_missing,
-                tracked_files=tracked_files,
-                tracked_trie=tracked_trie,
-            )
-            futures[future] = stage_name
+    stage_state_dirs = {
+        stage_name: registry.get_stage_state_dir(all_stages[stage_name], default_state_dir)
+        for stage_name in execution_order
+    }
 
-        for future in as_completed(futures):
-            stage_name = futures[future]
-            try:
-                explanations_by_name[stage_name] = future.result()
-            except Exception as e:
-                logger.warning(f"Failed to get explanation for {stage_name}: {e}")
-                explanations_by_name[stage_name] = StageExplanation(
-                    stage_name=stage_name,
-                    will_run=True,
-                    is_forced=False,
-                    reason=f"Error: {e}",
-                    code_changes=list[CodeChange](),
-                    param_changes=list[ParamChange](),
-                    dep_changes=list[DepChange](),
-                    upstream_stale=[],
+    # Open one shared readonly StateDB per unique state_dir up front. LMDB forbids
+    # opening the same env twice in a process, and racing opens from worker threads
+    # raise "File exists"; serial opens here are safe and the handles are shared
+    # across threads via MVCC read transactions.
+    with contextlib.ExitStack() as stack:
+        shared_state_dbs = dict[pathlib.Path, state_mod.StateDB]()
+        for state_dir in set(stage_state_dirs.values()):
+            if explain.state_db_exists(state_dir):
+                shared_state_dbs[state_dir] = stack.enter_context(
+                    state_mod.StateDB(state_dir, readonly=True)
                 )
 
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = dict[Future[StageExplanation], str]()
+            for stage_name in execution_order:
+                stage_info = all_stages[stage_name]
+                fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
+                stage_state_dir = stage_state_dirs[stage_name]
+                future = pool.submit(
+                    explain.get_stage_explanation,
+                    stage_name,
+                    fingerprint,
+                    stage_info["deps_paths"],
+                    stage_info["outs_paths"],
+                    stage_info["params"],
+                    overrides,
+                    stage_state_dir,
+                    force=force,
+                    allow_missing=allow_missing,
+                    tracked_files=tracked_files,
+                    tracked_trie=tracked_trie,
+                    state_db=shared_state_dbs.get(stage_state_dir),
+                )
+                futures[future] = stage_name
+
+            for future in as_completed(futures):
+                stage_name = futures[future]
+                try:
+                    explanation = future.result()
+                except Exception as e:
+                    logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                    failures.append((stage_name, e))
+                    continue
+                entries = explanation.pop("file_hash_entries", None)
+                if entries:
+                    hash_entries_by_state_dir.setdefault(stage_state_dirs[stage_name], []).extend(
+                        entries
+                    )
+                explanations_by_name[stage_name] = explanation
+
+    _write_back_hash_entries(hash_entries_by_state_dir)
+
+    if failures:
+        names = ", ".join(sorted(name for name, _ in failures))
+        raise exceptions.PivotError(
+            f"Failed to compute status for {len(failures)} stage(s): {names}"
+        ) from failures[0][1]
+
     return explanations_by_name
+
+
+def _write_back_hash_entries(
+    hash_entries_by_state_dir: dict[pathlib.Path, list[tuple[str, int, int, int, str]]],
+) -> None:
+    """Persist freshly computed dep hashes so future status/skip checks are stat-only.
+
+    Explanations hash against a readonly StateDB; entries are written back here in
+    one batch per state dir. Skipped when state.lmdb doesn't exist — explain/status
+    must not create it as a side effect.
+    """
+    for state_dir, entries in hash_entries_by_state_dir.items():
+        if not (state_dir / "state.lmdb").exists():
+            continue
+        try:
+            with state_mod.StateDB(state_dir) as state_db:
+                state_db.save_file_hash_entries(entries)
+        except exceptions.PivotDBWriteTimeoutError as e:
+            logger.warning(f"Skipping hash cache write-back for {state_dir}: {e}")
 
 
 def get_pipeline_explanations(

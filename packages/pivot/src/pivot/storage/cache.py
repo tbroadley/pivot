@@ -25,7 +25,7 @@ from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_ha
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.storage import state as state_mod
 
@@ -84,9 +84,14 @@ def atomic_write_file(
 
 
 def hash_file(
-    path: pathlib.Path, state_db: state_mod.StateDB | None = None
+    path: pathlib.Path,
+    state_db: state_mod.StateDB | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> tuple[str, os.stat_result]:
     """Compute xxhash64 of file contents, using state cache if available.
+
+    If file_hash_entries is provided, freshly computed hashes (cache misses) are
+    appended as (path, mtime_ns, size, inode, hash) for deferred StateDB write-back.
 
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
@@ -115,6 +120,11 @@ def hash_file(
                 hasher.update(chunk)
     file_hash = hasher.hexdigest()
     metrics.end("cache.hash_file", _t)
+
+    if file_hash_entries is not None:
+        file_hash_entries.append(
+            (str(path), file_stat.st_mtime_ns, file_stat.st_size, file_stat.st_ino, file_hash)
+        )
 
     if state_db is not None and not state_db.readonly:
         state_db.save(path, file_stat, file_hash)
@@ -177,6 +187,7 @@ def _scandir_recursive(path: pathlib.Path) -> Generator[os.DirEntry[str]]:
 def hash_directory(
     path: pathlib.Path,
     state_db: state_mod.StateDB | None = None,
+    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
 ) -> tuple[str, list[DirManifestEntry]]:
     """Compute tree hash of directory, returning hash and manifest.
 
@@ -191,6 +202,8 @@ def hash_directory(
     Args:
         path: Directory to hash
         state_db: Optional StateDB for caching file hashes
+        file_hash_entries: Optional collector for freshly computed per-file hashes
+            (cache misses), for deferred StateDB write-back
     """
     _t = metrics.start()
     manifest = list[DirManifestEntry]()
@@ -204,7 +217,7 @@ def hash_directory(
         try:
             rel = file_path.relative_to(path)
             file_stat = entry.stat(follow_symlinks=True)
-            file_hash, _ = hash_file(file_path, state_db)
+            file_hash, _ = hash_file(file_path, state_db, file_hash_entries)
             manifest_entry: DirManifestEntry = {
                 "relpath": str(rel),
                 "hash": file_hash,
@@ -739,6 +752,87 @@ def _restore_directory_from_cache(
                 lock_path.unlink(missing_ok=True)
             except OSError as e:
                 logger.debug(f"Failed to delete lock file: {e}")
+
+
+def restore_missing_in_directory(
+    path: pathlib.Path,
+    output_hash: DirHash,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode],
+) -> tuple[int, int]:
+    """Restore only the inner files of an existing directory that are missing on disk.
+
+    Additive only: never overwrites or deletes files already present, so it is safe
+    for a workspace that may contain local modifications. Used by --only-missing.
+
+    Returns:
+        Tuple of (restored_count, unavailable_count) where unavailable_count counts
+        missing files whose blob was absent from the cache.
+    """
+    resolved_base = path.resolve()
+    restored = 0
+    unavailable = 0
+    for entry in output_hash["manifest"]:
+        file_path = path / entry["relpath"]
+        # Validate no path traversal (e.g., "../../../etc/passwd")
+        if not file_path.resolve().is_relative_to(resolved_base):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {entry['relpath']!r}"
+            )
+        if file_path.exists():
+            continue
+        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        if not file_cache_path.exists():
+            unavailable += 1
+            continue
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _checkout_with_fallback(
+            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+        )
+        restored += 1
+    return (restored, unavailable)
+
+
+def sum_blob_sizes(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
+    """Total on-disk size of the given cache blobs (missing blobs count as 0)."""
+    files_dir = cache_dir / "files"
+    total = 0
+    for file_hash in hashes:
+        try:
+            total += get_cache_path(files_dir, file_hash).stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def remove_cache_blobs(cache_dir: pathlib.Path, hashes: Iterable[str]) -> int:
+    """Delete the given cache blobs and return the number actually removed.
+
+    Freed byte totals are computed by the caller via ``sum_blob_sizes`` (for the
+    dry-run/confirmation message), so this avoids a second full stat pass.
+
+    Blob files are read-only (0o444); deletion only needs a writable parent
+    directory, which _clear_path arranges without ever chmod-ing the blob itself
+    (blobs may be hardlinked to checked-out workspace files). Emptied prefix
+    directories are pruned. A blob that cannot be stat'd (missing, or any other
+    OSError) is skipped so one bad entry never leaves the cache half-collected.
+    """
+    files_dir = cache_dir / "files"
+    removed = 0
+    prefixes = set[pathlib.Path]()
+    for file_hash in hashes:
+        cache_path = get_cache_path(files_dir, file_hash)
+        try:
+            cache_path.stat()
+        except OSError:
+            continue
+        _clear_path(cache_path)
+        removed += 1
+        prefixes.add(cache_path.parent)
+    for prefix in prefixes:
+        with contextlib.suppress(OSError):
+            prefix.rmdir()  # only succeeds when empty
+    return removed
 
 
 def remove_output(path: pathlib.Path) -> None:

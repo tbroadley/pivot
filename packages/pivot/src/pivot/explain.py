@@ -6,6 +6,7 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -82,7 +83,7 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
-def _state_db_exists(state_dir: pathlib.Path) -> bool:
+def state_db_exists(state_dir: pathlib.Path) -> bool:
     """Return True when the LMDB directory already exists."""
     return (state_dir / "state.lmdb").exists()
 
@@ -99,6 +100,7 @@ def get_stage_explanation(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    state_db: state.StateDB | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -108,6 +110,11 @@ def get_stage_explanation(
             recorded hash for that dep (enabling remote verification).
         tracked_files: Dict of absolute path -> PvtData from .pvt files.
         tracked_trie: Trie of tracked paths for efficient lookup.
+        state_db: A pre-opened readonly StateDB to reuse. When explaining many
+            stages concurrently, the caller must open one shared env and pass it
+            here: LMDB forbids opening the same env twice in a process, and racing
+            opens raise "File exists". When None, this function opens (and closes)
+            its own StateDB if one exists on disk.
     """
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
@@ -141,63 +148,76 @@ def get_stage_explanation(
     # Check generation tracking first (O(1) skip detection) when StateDB exists.
     # explain/status should not create state.lmdb as a side effect.
     # Use verify_files=False since status predicts run behavior after restoration.
-    if _state_db_exists(state_dir):
-        with state.StateDB(state_dir, readonly=True) as state_db:
-            if not force and worker.can_skip_via_generation(
+    def _can_skip(db: state.StateDB) -> bool:
+        return not force and worker.can_skip_via_generation(
+            stage_name=stage_name,
+            fingerprint=fingerprint,
+            deps=deps,
+            outs_paths=outs_paths,
+            current_params=current_params,
+            lock_data=lock_data,
+            state_db=db,
+            verify_files=False,
+        )
+
+    # Reuse the caller's shared StateDB when provided; otherwise open our own for
+    # the duration of this call (skip check + dep hashing) so freshly computed dep
+    # hashes can be collected for write-back. explain/status must not create
+    # state.lmdb as a side effect, so we only open when one already exists.
+    with contextlib.ExitStack() as stack:
+        if state_db is None and state_db_exists(state_dir):
+            state_db = stack.enter_context(state.StateDB(state_dir, readonly=True))
+
+        if state_db is not None and _can_skip(state_db):
+            return StageExplanation(
                 stage_name=stage_name,
-                fingerprint=fingerprint,
-                deps=deps,
-                outs_paths=outs_paths,
-                current_params=current_params,
-                lock_data=lock_data,
-                state_db=state_db,
-                verify_files=False,
-            ):
-                return StageExplanation(
-                    stage_name=stage_name,
-                    will_run=False,
-                    is_forced=False,
-                    reason="",
-                    code_changes=[],
-                    param_changes=[],
-                    dep_changes=[],
-                    upstream_stale=[],
-                )
+                will_run=False,
+                is_forced=False,
+                reason="",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[],
+                upstream_stale=[],
+            )
 
-    # Hash dependencies - with optional fallback for missing files
-    if allow_missing:
-        deps_to_hash = list[str]()
-        fallback_hashes = dict[str, HashInfo]()
-        missing_deps = list[str]()
+        # Hash dependencies - with optional fallback for missing files
+        if allow_missing:
+            deps_to_hash = list[str]()
+            fallback_hashes = dict[str, HashInfo]()
+            missing_deps = list[str]()
 
-        for dep in deps:
-            dep_path = pathlib.Path(dep)
-            if dep_path.exists():
-                deps_to_hash.append(dep)
-            else:
-                # Try .pvt file first
-                hash_info = None
-                if tracked_files is not None and tracked_trie is not None:
-                    hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
-                # Fall back to lock file hash (for remote verification)
-                normalized = str(project.normalize_path(dep))
-                if hash_info is None:
-                    hash_info = lock_data["dep_hashes"].get(normalized)
-                if hash_info:
-                    fallback_hashes[normalized] = hash_info
+            for dep in deps:
+                dep_path = pathlib.Path(dep)
+                if dep_path.exists():
+                    deps_to_hash.append(dep)
                 else:
-                    missing_deps.append(dep)
+                    # Try .pvt file first
+                    hash_info = None
+                    if tracked_files is not None and tracked_trie is not None:
+                        hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
+                    # Fall back to lock file hash (for remote verification)
+                    normalized = str(project.normalize_path(dep))
+                    if hash_info is None:
+                        hash_info = lock_data["dep_hashes"].get(normalized)
+                    if hash_info:
+                        fallback_hashes[normalized] = hash_info
+                    else:
+                        missing_deps.append(dep)
 
-        file_hashes, more_missing, unreadable_deps, _ = worker.hash_dependencies(deps_to_hash)
-        dep_hashes = {**file_hashes, **fallback_hashes}
-        missing_deps.extend(more_missing)
-    else:
-        dep_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(deps)
+            file_hashes, more_missing, unreadable_deps, file_hash_entries = (
+                worker.hash_dependencies(deps_to_hash, state_db)
+            )
+            dep_hashes = {**file_hashes, **fallback_hashes}
+            missing_deps.extend(more_missing)
+        else:
+            dep_hashes, missing_deps, unreadable_deps, file_hash_entries = worker.hash_dependencies(
+                deps, state_db
+            )
 
     if missing_deps:
         # Convert to relative paths for user-facing message
         rel_missing = [project.to_relative_path(p) for p in missing_deps]
-        return StageExplanation(
+        explanation = StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
@@ -207,11 +227,10 @@ def get_stage_explanation(
             dep_changes=[],
             upstream_stale=[],
         )
-
-    if unreadable_deps:
+    elif unreadable_deps:
         # Convert to relative paths for user-facing message
         rel_unreadable = [project.to_relative_path(p) for p in unreadable_deps]
-        return StageExplanation(
+        explanation = StageExplanation(
             stage_name=stage_name,
             will_run=True,
             is_forced=force,
@@ -221,24 +240,27 @@ def get_stage_explanation(
             dep_changes=[],
             upstream_stale=[],
         )
+    else:
+        decision = skip.check_stage(
+            lock_data=lock_data,
+            fingerprint=fingerprint,
+            params=current_params,
+            dep_hashes=dep_hashes,
+            out_paths=outs_paths,
+            explain=True,
+            force=force,
+        )
+        explanation = StageExplanation(
+            stage_name=stage_name,
+            will_run=decision["changed"],
+            is_forced=force,
+            reason=decision["reason"],
+            code_changes=decision.get("code_changes", []),
+            param_changes=decision.get("param_changes", []),
+            dep_changes=decision.get("dep_changes", []),
+            upstream_stale=[],
+        )
 
-    decision = skip.check_stage(
-        lock_data=lock_data,
-        fingerprint=fingerprint,
-        params=current_params,
-        dep_hashes=dep_hashes,
-        out_paths=outs_paths,
-        explain=True,
-        force=force,
-    )
-
-    return StageExplanation(
-        stage_name=stage_name,
-        will_run=decision["changed"],
-        is_forced=force,
-        reason=decision["reason"],
-        code_changes=decision.get("code_changes", []),
-        param_changes=decision.get("param_changes", []),
-        dep_changes=decision.get("dep_changes", []),
-        upstream_stale=[],
-    )
+    if file_hash_entries:
+        explanation["file_hash_entries"] = file_hash_entries
+    return explanation

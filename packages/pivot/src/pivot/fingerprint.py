@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import contextvars
 import dataclasses
+import enum
 import functools
 import inspect
 import json
@@ -12,6 +13,7 @@ import os
 import pathlib
 import sys
 import textwrap
+import threading
 import types
 import typing
 import weakref
@@ -70,8 +72,9 @@ _STDLIB_PATHS = _init_stdlib_paths()
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
 # while ensuring stale entries are automatically cleaned up when functions are GC'd.
-# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
-# per process (multiprocessing uses separate memory spaces), so this is safe.
+# Note: WeakKeyDictionary (and the other module-level caches below) is not thread-safe.
+# Callers may fingerprint concurrently (e.g. status computes explanations via a
+# ThreadPoolExecutor), so the public entry points are serialized by _fingerprint_lock.
 _hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
     weakref.WeakKeyDictionary()
 )
@@ -113,6 +116,23 @@ _active_source_map: dict[str, tuple[int, int, int]] | None = None
 _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_current_stage_name", default=None
 )
+
+# The module-level caches above are not thread-safe. A reentrant lock serializes the public
+# fingerprint entry points so concurrent callers (e.g. status's ThreadPoolExecutor) can't
+# corrupt them; the fingerprint work is CPU-bound and fast, and the I/O-bound work callers
+# parallelize (lock-file reads, output hashing) happens outside these functions.
+_fingerprint_lock = threading.RLock()
+
+
+def _synchronized[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """Serialize a fingerprint entry point on _fingerprint_lock (reentrant: nested calls ok)."""
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        with _fingerprint_lock:
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _close_state_db() -> None:
@@ -347,6 +367,7 @@ def _manifest_references_paths(raw: bytes, changed_paths: set[str]) -> bool:
     return any(source_path in changed_paths for source_path in sources)
 
 
+@_synchronized
 def invalidate_manifests_for_paths(
     paths: Sequence[str | os.PathLike[str] | pathlib.Path],
 ) -> None:
@@ -396,6 +417,7 @@ def invalidate_manifests_for_paths(
         )
 
 
+@_synchronized
 def get_stage_fingerprint(
     func: Callable[..., Any], visited: set[int] | None = None
 ) -> dict[str, str]:
@@ -420,6 +442,7 @@ def get_stage_fingerprint(
     return result
 
 
+@_synchronized
 def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> dict[str, str]:
     """Like get_stage_fingerprint, but with manifest-level caching.
 
@@ -642,6 +665,114 @@ def _process_class_body_dependencies(
         if hasattr(resolved, "model_fields"):
             _hash_pydantic_schema(cast("type[_PydanticModelProtocol]", resolved), manifest, visited)
 
+    _process_class_methods(cls, manifest, visited)
+
+
+# Dunders users typically author with real logic AND that dataclass/pydantic/namedtuple do
+# NOT auto-generate. Walking these follows their transitive deps; excluding the generated ones
+# (__init__, __eq__, ordering, __hash__, __repr__, frozen __setattr__, pickling hooks, etc.)
+# avoids churn from synthesized code. Body edits to any dunder are still caught by the class AST.
+_FINGERPRINTED_DUNDERS = frozenset(
+    {
+        "__call__",
+        "__str__",
+        "__bytes__",
+        "__format__",
+        "__getattr__",
+        "__len__",
+        "__length_hint__",
+        "__contains__",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+        "__iter__",
+        "__next__",
+        "__reversed__",
+        "__enter__",
+        "__exit__",
+        "__aenter__",
+        "__aexit__",
+        "__aiter__",
+        "__anext__",
+        "__await__",
+        "__post_init__",
+        "__add__",
+        "__radd__",
+        "__iadd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__floordiv__",
+        "__mod__",
+        "__pow__",
+        "__matmul__",
+        "__and__",
+        "__or__",
+        "__xor__",
+        "__invert__",
+        "__neg__",
+        "__pos__",
+        "__abs__",
+        "__round__",
+        "__index__",
+        "__int__",
+        "__float__",
+        "__bool__",
+    }
+)
+
+
+def _member_functions(member: Any) -> list[tuple[str, Any]]:
+    """Return the underlying (key-suffix, function) pairs a class member wraps.
+
+    A plain method, classmethod, or staticmethod yields one function under the "" suffix
+    (so its manifest key is unchanged). A property yields its getter (""), and any setter
+    (".setter") and deleter (".deleter") under distinct suffixes. A functools.cached_property
+    yields its wrapped function. Each accessor gets its own key so that a helper used only
+    by, say, a setter still invalidates the stage when it changes.
+    """
+    if isinstance(member, property):
+        return [
+            (suffix, fn)
+            for suffix, fn in (
+                ("", member.fget),
+                (".setter", member.fset),
+                (".deleter", member.fdel),
+            )
+            if fn is not None
+        ]
+    if isinstance(member, functools.cached_property):
+        return [("", cast("Any", member.func))]
+    # Unwrap classmethod/staticmethod (.__func__) to the raw function; else the member itself.
+    unwrapped = getattr(member, "__func__", None)
+    return [("", unwrapped if unwrapped is not None else member)]
+
+
+def _process_class_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
+    """Fingerprint methods defined on a class so their transitive deps are followed.
+
+    The class AST hash (via `_add_callable_to_manifest`) already captures textual edits
+    to method bodies, but NOT the helpers/constants a method calls. Walk each method as a
+    callable so changes to what it depends on invalidate the stage too — the same guarantee
+    standalone functions get. This is why data classes may carry methods without breaking
+    change detection. Covers plain methods, classmethods, staticmethods, properties
+    (getter/setter/deleter), functools.cached_property, and user-authored behavioral
+    dunders (see `_FINGERPRINTED_DUNDERS`).
+    """
+    # Module-qualify the class so same-named classes from different modules (Config, Params,
+    # …) don't collide on one manifest key and silently overwrite each other's method hashes.
+    class_id = f"{cls.__module__}.{cls.__qualname__}"
+    for name, member in vars(cls).items():
+        if name.startswith("__") and name.endswith("__") and name not in _FINGERPRINTED_DUNDERS:
+            continue
+        for suffix, func in _member_functions(member):
+            if callable(func) and is_user_code(func):
+                _add_callable_to_manifest(
+                    f"method:{class_id}.{name}{suffix}", func, manifest, visited
+                )
+
 
 def _collect_annotation_names(
     node: ast.AST, names: set[str], dotted_refs: list[tuple[str, ...]]
@@ -694,6 +825,7 @@ def _resolve_dotted_path(parts: tuple[str, ...], ns: dict[str, Any]) -> Any:
     return obj
 
 
+@_synchronized
 def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """Generate fingerprint manifest for a loader instance.
 
@@ -776,21 +908,71 @@ def _check_mutable_capture(var_name: str, value: Any, stage_name: str) -> None:
     raise exceptions.StageDefinitionError(message)
 
 
-def _check_data_class_methods(cls: type) -> None:
-    allowed = frozenset({"model_post_init", "model_validate", "model_rebuild"})
-    user_methods = [
-        name
-        for name, val in vars(cls).items()
-        if callable(val)
-        and not (name.startswith("__") and name.endswith("__"))
-        and name not in allowed
-    ]
-    if user_methods:
-        message = (
-            f"Data class '{cls.__qualname__}' has methods {user_methods}. "
-            + "Move these to standalone functions for reliable change detection."
-        )
-        raise exceptions.StageDefinitionError(message)
+def _find_unsound_collection_element(
+    value: tuple[Any, ...] | frozenset[Any], _seen: set[int] | None = None
+) -> str | None:
+    """Return a reason an immutable collection can't be soundly fingerprinted, else None.
+
+    Primitives are content-hashable; enum members and frozen dataclass/pydantic instances are
+    content-hashable and their class is tracked (like a standalone capture); callables are tracked
+    via _process_collection_dependency; nested tuples/frozensets are inspected recursively. A
+    nested mutable collection (dict/list/set) or any other element (a mutable class instance, etc.)
+    means the collection's data can change without a code change, so it is reported.
+    """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(cast("object", value))
+    if obj_id in _seen:
+        return None
+    _seen.add(obj_id)
+    try:
+        for item in value:
+            if isinstance(item, (bool, int, float, str, bytes, type(None))):
+                continue
+            if isinstance(item, enum.Enum):
+                continue
+            if _is_frozen_dataclass(item) or _is_frozen_pydantic(item):
+                continue
+            if callable(item):
+                continue
+            if isinstance(item, (dict, list, set)):
+                return f"nests a mutable {type(cast('object', item)).__name__}"
+            if isinstance(item, (tuple, frozenset)):
+                nested = _find_unsound_collection_element(
+                    cast("tuple[Any, ...] | frozenset[Any]", item), _seen
+                )
+                if nested is not None:
+                    return nested
+                continue
+            return f"contains an element of type '{type(cast('object', item)).__name__}'"
+        return None
+    finally:
+        _seen.discard(obj_id)
+
+
+def _check_immutable_collection_capture(var_name: str, value: Any, stage_name: str) -> None:
+    """Reject a captured tuple/frozenset that nests mutable state or an unsupported element.
+
+    Keeps immutable-collection capture consistent with bare mutable capture: a `(1, [2, 3])`
+    tuple can be mutated at runtime just like a bare list, and a `(SomeInstance(),)` tuple
+    would otherwise be silently dropped from the fingerprint. Honors unsafe_fingerprinting.
+    """
+    reason = _find_unsound_collection_element(value)
+    if reason is None:
+        return
+    message = (
+        f"Stage '{stage_name}': closure captures '{var_name}' "
+        f"({type(value).__name__}) which {reason}.\n"
+        "Pivot cannot track changes to mutable runtime state, which may cause silent wrong "
+        "outputs.\n"
+        "Fix: use only primitives, callables, or nested tuples/frozensets of these; or pass "
+        "the data via StageParams or a Dep(...) input.\n"
+        "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+    )
+    if _is_unsafe_fingerprinting_enabled():
+        _logger.warning(message)
+        return
+    raise exceptions.StageDefinitionError(message)
 
 
 def _is_frozen_dataclass(value: Any) -> bool:
@@ -850,6 +1032,12 @@ def _process_closure_values(
             _process_partial_dependency(
                 name, cast("functools.partial[Any]", value), manifest, visited
             )
+        elif isinstance(value, enum.Enum):
+            # Enum members are immutable-by-convention, like the frozen dataclasses handled
+            # below. This MUST come before the callable branches: an enum defining __call__
+            # makes its members callable, which would otherwise route them to id()-based
+            # fallback hashing.
+            _process_enum_dependency(f"enum:{name}", value, manifest, visited)
         elif callable(value) and is_user_code(value):
             _process_callable_dependency(name, value, manifest, visited)
         elif callable(value):
@@ -867,6 +1055,15 @@ def _process_closure_values(
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
             if isinstance(value, (dict, list, set)):
                 _check_mutable_capture(name, value, stage_name)
+            else:
+                # Immutable containers (tuple/frozenset): reject any that nest a mutable
+                # collection or an element we can't soundly fingerprint, then content-hash
+                # the pure-primitive ones (callables inside are tracked below regardless).
+                _check_immutable_collection_capture(name, value, stage_name)
+                if _is_primitive_collection(cast("object", value)):
+                    manifest[f"const:{name}"] = xxhash.xxh64(
+                        _serialize_value_for_hash(value).encode()
+                    ).hexdigest()
             _process_collection_dependency(
                 name,
                 cast(
@@ -929,6 +1126,53 @@ def _process_instance_dependency(
     """Track the class definition of a user-defined instance."""
     cls = cast("type[Any]", type(instance))
     _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+
+
+def _encode_enum_member_value(cls: type, member: enum.Enum) -> str:
+    """Canonically encode an enum member's value for fingerprinting.
+
+    `repr` distinguishes types for primitives (e.g. bytes `b'a'` vs str `"b'a'"`); primitive
+    collections are content-hashed. A value that cannot be soundly encoded raises, per the
+    strict error policy — silently ignoring it would let a value change go undetected.
+    """
+    value = member.value
+    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return repr(value)
+    if _is_primitive_collection(value):
+        return xxhash.xxh64(_serialize_value_for_hash(value).encode()).hexdigest()
+    message = (
+        f"Enum member '{cls.__qualname__}.{member.name}' has a value of type "
+        f"'{type(value).__name__}', which cannot be soundly fingerprinted. Use a primitive "
+        "or a collection of primitives as the enum value."
+    )
+    raise exceptions.StageDefinitionError(message)
+
+
+def _enum_class_has_source(cls: type) -> bool:
+    """Whether the enum class has retrievable source (False for functionally-created enums)."""
+    try:
+        inspect.getsource(cls)
+    except (OSError, TypeError):
+        return False
+    return True
+
+
+def _process_enum_dependency(
+    key: str, member: enum.Enum, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Track a captured enum member: its identity, its value, and its class's methods.
+
+    Recording the value (not just the member name) catches value edits the class AST misses:
+    values computed from other globals, IntFlag/Flag pseudo-members (whose `.name` is None),
+    and functionally-created enums. The class definition is walked for method transitive deps
+    only when it has source — a source-less functional enum would otherwise fall back to an
+    id()-based, cross-process-unstable hash.
+    """
+    cls = type(member)
+    manifest[key] = f"{cls.__qualname__}.{member.name}"
+    manifest[f"{key}.value"] = _encode_enum_member_value(cls, member)
+    if _enum_class_has_source(cls):
+        _add_callable_to_manifest(f"{key}.__class__", cls, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -1010,8 +1254,6 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
 
     if not is_user_code(hint_type):
         return
-    if dataclasses.is_dataclass(hint_type):
-        _check_data_class_methods(hint_type)
 
     key = f"class:{hint_type.__name__}"
     if key not in manifest:
@@ -1116,31 +1358,48 @@ def _discover_pydantic_field_types(
             )
 
 
-def _serialize_value_for_hash(value: Any) -> str:
-    """Serialize a value to a stable string for hashing."""
+def _canonicalize_for_hash(value: Any) -> Any:
+    """Convert a value into a JSON-serializable, order-stable, TYPE-TAGGED form.
+
+    Every node carries a type tag so values JSON would otherwise conflate stay distinct:
+    `(1, 2)` vs `[1, 2]` vs `frozenset({1, 2})`, `b"1"` vs `"1"`, and dict keys `1` vs `"1"`
+    (JSON coerces int keys to strings). Sets/frozensets and dicts are sorted at every depth
+    for cross-process stability — their native iteration order depends on `PYTHONHASHSEED`.
+    """
+    if isinstance(value, bool):  # before int: bool is a subclass of int
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", value]
+    if isinstance(value, float):
+        return ["float", repr(value)]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, bytes):
+        return ["bytes", value.hex()]
+    if value is None:
+        return ["none"]
     if hasattr(value, "model_dump"):
-        return json.dumps(value.model_dump(), sort_keys=True, default=str)
-
-    if isinstance(value, (list, tuple)):
-        items: list[Any] = []
-        for item in cast("list[Any]", value):
-            if hasattr(item, "model_dump"):
-                items.append(item.model_dump())
-            else:
-                items.append(item)
-        return json.dumps(items, sort_keys=True, default=str)
-
+        return ["model", type(value).__qualname__, _canonicalize_for_hash(value.model_dump())]
+    if isinstance(value, list):
+        return ["list", [_canonicalize_for_hash(item) for item in cast("list[Any]", value)]]
+    if isinstance(value, tuple):
+        return ["tuple", [_canonicalize_for_hash(item) for item in cast("tuple[Any, ...]", value)]]
     if isinstance(value, (set, frozenset)):
-        # Sort for deterministic ordering
-        items_to_sort = cast("set[Any] | frozenset[Any]", value)
-        return json.dumps(
-            sorted(items_to_sort, key=lambda x: (type(x).__name__, str(x))), default=str
-        )
-
+        tag = "frozenset" if isinstance(value, frozenset) else "set"
+        canon = [_canonicalize_for_hash(item) for item in cast("set[Any]", value)]
+        return [tag, sorted(canon, key=lambda x: json.dumps(x))]
     if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, default=str)
+        pairs = [
+            [_canonicalize_for_hash(k), _canonicalize_for_hash(v)]
+            for k, v in cast("dict[Any, Any]", value).items()
+        ]
+        return ["dict", sorted(pairs, key=lambda kv: json.dumps(kv[0]))]
+    return ["repr", repr(value)]
 
-    return repr(value)
+
+def _serialize_value_for_hash(value: Any) -> str:
+    """Serialize a value to a stable, type-distinguishing string for hashing."""
+    return json.dumps(_canonicalize_for_hash(value), sort_keys=True, default=str)
 
 
 def _process_collection_dependency(
@@ -1149,13 +1408,16 @@ def _process_collection_dependency(
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
-    """Scan collection for callable user code and add to manifest."""
+    """Scan collection for callable user code and enum members and add them to the manifest.
+
+    Enum members and frozen dataclass/pydantic instances are tracked like a standalone capture
+    (identity/class source), so a tuple/frozenset of them is fingerprinted as soundly as the
+    elements would be individually.
+    """
     if isinstance(collection, dict):
         # Use sorted keys for deterministic ordering
         for key in sorted(collection.keys(), key=_sort_key):
-            value = collection[key]
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{key!r}]", value, manifest, visited)
+            _process_collection_element(f"{name}[{key!r}]", collection[key], manifest, visited)
     else:
         # For sequences and sets, use enumerate for index-based keys
         # Sort sets for deterministic ordering
@@ -1165,8 +1427,22 @@ def _process_collection_dependency(
             else collection
         )
         for i, value in enumerate(items):
-            if callable(value) and is_user_code(value):
-                _add_callable_to_manifest(f"func:{name}[{i}]", value, manifest, visited)
+            _process_collection_element(f"{name}[{i}]", value, manifest, visited)
+
+
+def _process_collection_element(
+    ref: str, value: Any, manifest: dict[str, str], visited: set[int]
+) -> None:
+    """Track an enum member, frozen dataclass/pydantic instance, or user callable held in a
+    collection — mirroring how the same value is tracked when captured standalone."""
+    if isinstance(value, enum.Enum):
+        _process_enum_dependency(f"enum:{ref}", value, manifest, visited)
+    elif _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
+        # Only frozen instances reach here — mutable ones are rejected upstream by
+        # _check_immutable_collection_capture. Track the class like a standalone frozen capture.
+        _process_instance_dependency(ref, value, manifest, visited)
+    elif callable(value) and is_user_code(value):
+        _add_callable_to_manifest(f"func:{ref}", value, manifest, visited)
 
 
 def _sort_key(value: Any) -> tuple[str, str]:
@@ -1177,32 +1453,43 @@ def _sort_key(value: Any) -> tuple[str, str]:
 def _is_primitive_collection(value: object, _seen: set[int] | None = None) -> bool:
     """Check if value is a collection containing only primitives (recursively).
 
-    Uses _seen set to detect circular references and prevent infinite recursion.
-    Circular references return False (not a primitive collection).
+    `_seen` is the set of object ids on the CURRENT recursion path (a stack), used to
+    detect genuine circular references (an object that transitively contains itself) and
+    prevent infinite recursion. Each id is removed once its branch finishes, so a value
+    that merely references the same immutable sub-collection more than once (e.g.
+    `(INNER, INNER)`, or two equal literals CPython folds to one object) is NOT mistaken
+    for a cycle — otherwise its contents would be silently dropped from the fingerprint.
     """
     if isinstance(value, (bool, int, float, str, bytes, type(None))):
         return True
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, enum.Enum):
+        # Enum members are immutable and content-hashable (canonicalized by qualname + name).
+        # Their class is tracked separately via _process_collection_dependency.
+        return True
+    if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
+        # Frozen dataclass/pydantic instances are immutable-by-convention and content-hashable
+        # (via model_dump / repr). Their class is tracked via _process_collection_dependency.
+        return True
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
         obj_id = id(cast("object", value))  # Cast: isinstance leaves element types Unknown
         if _seen is None:
             _seen = set()
         if obj_id in _seen:
-            return False  # Circular reference
+            return False  # Circular reference (object contains itself on this path)
         _seen.add(obj_id)
-        items = cast("list[object] | tuple[object, ...] | set[object] | frozenset[object]", value)
-        return all(_is_primitive_collection(item, _seen) for item in items)
-    if isinstance(value, dict):
-        obj_id = id(cast("object", value))  # Cast: isinstance leaves key/value types Unknown
-        if _seen is None:
-            _seen = set()
-        if obj_id in _seen:
-            return False  # Circular reference
-        _seen.add(obj_id)
-        items_dict = cast("dict[object, object]", value)
-        return all(
-            _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
-            for k, v in items_dict.items()
-        )
+        try:
+            if isinstance(value, dict):
+                items_dict = cast("dict[object, object]", value)
+                return all(
+                    _is_primitive_collection(k, _seen) and _is_primitive_collection(v, _seen)
+                    for k, v in items_dict.items()
+                )
+            items = cast(
+                "list[object] | tuple[object, ...] | set[object] | frozenset[object]", value
+            )
+            return all(_is_primitive_collection(item, _seen) for item in items)
+        finally:
+            _seen.discard(obj_id)
     return False
 
 
@@ -1232,6 +1519,8 @@ def _process_module_dependency(
     if not is_user_code(module):
         return
 
+    stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
+
     _t = metrics.start()
     attrs = ast_utils.extract_module_attr_usage(func)
     metrics.end("fingerprint.extract_module_attr_usage", _t)
@@ -1248,16 +1537,39 @@ def _process_module_dependency(
         except AttributeError:
             manifest[key] = "unknown"
             continue
-        if callable(attr_value) and is_user_code(attr_value):
+        if isinstance(attr_value, enum.Enum):
+            # Track the member identity + value; hash the enum class for methods/definitions.
+            # Must precede the callable branch: enum members are callable when the enum
+            # defines __call__, and callable handling would fall back to id()-based hashing.
+            _process_enum_dependency(key, attr_value, manifest, visited)
+        elif callable(attr_value) and is_user_code(attr_value):
             _add_callable_to_manifest(key, attr_value, manifest, visited)
         elif isinstance(attr_value, (bool, int, float, str, bytes, type(None))):
             manifest[key] = repr(attr_value)
-        elif _is_primitive_collection(attr_value):
-            value_str = _serialize_value_for_hash(attr_value)
-            manifest[key] = xxhash.xxh64(value_str.encode()).hexdigest()
+        elif isinstance(attr_value, (dict, list, set, tuple, frozenset)):
+            # Apply the SAME strictness as the closure-capture path: a `mod.ATTR` collection
+            # is just a module-namespace entry, equally mutable at runtime as a same-module
+            # global, so it must not be treated as "more constant". Bare dict/list/set trigger
+            # `_check_mutable_capture`; tuple/frozenset that nest mutable state or an
+            # unsupported element trigger `_check_immutable_collection_capture`; pure-primitive
+            # immutable collections are content-hashed. Both honor `unsafe_fingerprinting`.
+            attr_ref = f"{mod_name}.{attr_name}"
+            collection = cast(
+                "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
+                attr_value,
+            )
+            if isinstance(attr_value, (dict, list, set)):
+                _check_mutable_capture(attr_ref, collection, stage_name)
+            else:
+                _check_immutable_collection_capture(attr_ref, collection, stage_name)
+                if _is_primitive_collection(cast("object", attr_value)):
+                    manifest[key] = xxhash.xxh64(
+                        _serialize_value_for_hash(attr_value).encode()
+                    ).hexdigest()
+            _process_collection_dependency(attr_ref, collection, manifest, visited)
         else:
             raise TypeError(
-                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, or collections of primitives."
+                f"Cannot fingerprint module attribute '{key}': type {type(attr_value).__name__!r} is not supported. Supported types: callable, primitives, enums, or collections."
             )
 
 
@@ -1332,6 +1644,7 @@ def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
     return hasattr(func, "__wrapped__")
 
 
+@_synchronized
 def hash_function_ast(func: Callable[..., Any]) -> str:
     """Hash function AST (ignores whitespace, comments, docstrings).
 
@@ -1504,6 +1817,7 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
     )
 
 
+@_synchronized
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins)."""
     _t = metrics.start()

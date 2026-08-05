@@ -537,29 +537,41 @@ async def test_pull_async_downloads_missing(
     mock_state.remote_hashes_add.assert_called()
 
 
-async def test_pull_async_without_stages_lists_remote(
-    lock_project: Path, mocker: MockerFixture
+async def test_pull_async_without_targets_pulls_only_referenced(
+    lock_project: Path, mocker: MockerFixture, make_valid_lock_content: ValidLockContentFactory
 ) -> None:
-    """Pull without stages lists all hashes from remote."""
+    """Pull without targets fetches project-referenced hashes, never lists the remote."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
     (cache_dir / "files").mkdir(parents=True)
 
-    hash1 = "ab" + "c" * 14
+    referenced_hash = "ab" + "c" * 14
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": referenced_hash}])
+    lock_path = lock_project / ".pivot" / "stages" / "my_stage.lock"
+    with lock_path.open("w") as f:
+        yaml.dump(lock_data, f)
+
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
-    mock_remote.list_hashes = mocker.AsyncMock(return_value={hash1})
     mock_remote.download_batch = mocker.AsyncMock(
-        return_value=[TransferResult(hash=hash1, success=True)]
+        return_value=[TransferResult(hash=referenced_hash, success=True)]
     )
 
     result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=None
+        cache_dir,
+        state_dir,
+        mock_remote,
+        mock_state,
+        "origin",
+        targets=None,
+        all_stages=_helper_make_all_stages("my_stage"),
     )
 
     assert result["transferred"] == 1
-    mock_remote.list_hashes.assert_called_once()
+    mock_remote.list_hashes.assert_not_called()
+    requested_hashes = {item[0] for item in mock_remote.download_batch.call_args.args[0]}
+    assert requested_hashes == {referenced_hash}
 
 
 async def test_pull_async_handles_failures(
@@ -740,8 +752,10 @@ async def test_pull_async_integration(
     tmp_path: Path,
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
-    """Integration: pull files from real moto S3."""
+    """Integration: pull a project-referenced file from real moto S3."""
     hash1 = "ab" + "c" * 14
 
     await aioboto3_s3_client.put_object(
@@ -750,13 +764,27 @@ async def test_pull_async_integration(
         Body=b"content1",
     )
 
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     state_dir = tmp_path / ".pivot"
     cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True)
+    stages_dir = state_dir / "stages"
+    stages_dir.mkdir(parents=True)
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
+    with (stages_dir / "my_stage.lock").open("w") as f:
+        yaml.dump(lock_data, f)
 
     state_db = state_mod.StateDB(state_dir)
 
-    await transfer._pull_async(cache_dir, state_dir, s3_remote, state_db, "origin")
+    await transfer._pull_async(
+        cache_dir,
+        state_dir,
+        s3_remote,
+        state_db,
+        "origin",
+        targets=None,
+        all_stages=_helper_make_all_stages("my_stage"),
+    )
 
     files_dir = cache_dir / "files"
     cache_path = cache_mod.get_cache_path(files_dir, hash1)
@@ -768,6 +796,8 @@ async def test_push_pull_roundtrip_integration(
     tmp_path: Path,
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
+    make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
     """Integration: push then pull to verify roundtrip."""
     hash1 = "ab" + "c" * 14
@@ -785,12 +815,26 @@ async def test_push_pull_roundtrip_integration(
 
     await transfer._push_async(cache_dir1, state_dir1, s3_remote, state_db1, "origin")
 
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     state_dir2 = tmp_path / ".pivot2"
     cache_dir2 = state_dir2 / "cache"
     cache_dir2.mkdir(parents=True)
+    stages_dir2 = state_dir2 / "stages"
+    stages_dir2.mkdir(parents=True)
+    lock_data = make_valid_lock_content(outs=[{"path": "out.csv", "hash": hash1}])
+    with (stages_dir2 / "my_stage.lock").open("w") as f:
+        yaml.dump(lock_data, f)
     state_db2 = state_mod.StateDB(state_dir2)
 
-    await transfer._pull_async(cache_dir2, state_dir2, s3_remote, state_db2, "origin")
+    await transfer._pull_async(
+        cache_dir2,
+        state_dir2,
+        s3_remote,
+        state_db2,
+        "origin",
+        targets=None,
+        all_stages=_helper_make_all_stages("my_stage"),
+    )
 
     files_dir2 = cache_dir2 / "files"
     cache_path2 = cache_mod.get_cache_path(files_dir2, hash1)
@@ -841,7 +885,7 @@ async def test_pull_async_with_deps_integration(
     aioboto3_s3_client: S3Client,
     make_valid_lock_content: ValidLockContentFactory,
 ) -> None:
-    """Integration: pull with dependency hashes."""
+    """Integration: pull fetches a dep that is an upstream stage's cached output."""
     out_hash = "ab" + "c" * 14
     dep_hash = "de" + "f" * 14
 
@@ -860,14 +904,20 @@ async def test_pull_async_with_deps_integration(
     cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True)
 
-    lock_data = make_valid_lock_content(
+    stages_dir = state_dir / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    upstream_lock = make_valid_lock_content(
+        outs=[{"path": "in.csv", "hash": dep_hash}],
+        deps=[],
+    )
+    with (stages_dir / "upstream.lock").open("w") as f:
+        yaml.dump(upstream_lock, f)
+    downstream_lock = make_valid_lock_content(
         outs=[{"path": "out.csv", "hash": out_hash}],
         deps=[{"path": "in.csv", "hash": dep_hash}],
     )
-    lock_path = state_dir / "stages" / "my_stage.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("w") as f:
-        yaml.dump(lock_data, f)
+    with (stages_dir / "my_stage.lock").open("w") as f:
+        yaml.dump(downstream_lock, f)
 
     state_db = state_mod.StateDB(state_dir)
 
@@ -878,7 +928,7 @@ async def test_pull_async_with_deps_integration(
         state_db,
         "origin",
         targets=["my_stage"],
-        all_stages=_helper_make_all_stages("my_stage"),
+        all_stages=_helper_make_all_stages("upstream", "my_stage"),
     )
 
     files_dir = cache_dir / "files"
@@ -886,6 +936,54 @@ async def test_pull_async_with_deps_integration(
     dep_path = cache_mod.get_cache_path(files_dir, dep_hash)
     assert out_path.read_bytes() == b"main_file"
     assert dep_path.read_bytes() == b"dependency_file"
+    state_db.close()
+
+
+async def test_pull_async_skips_raw_input_dep(
+    tmp_path: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+    make_valid_lock_content: ValidLockContentFactory,
+) -> None:
+    """Integration (issue #460): a raw-input dep is never fetched, so no failure."""
+    out_hash = "ab" + "c" * 14
+    dep_hash = "de" + "f" * 14
+
+    await aioboto3_s3_client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=remote_mod._hash_to_key(s3_remote.prefix, out_hash),
+        Body=b"main_file",
+    )
+
+    state_dir = tmp_path / ".pivot"
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True)
+
+    lock_data = make_valid_lock_content(
+        outs=[{"path": "out.csv", "hash": out_hash}],
+        deps=[{"path": "spec.yaml", "hash": dep_hash}],
+    )
+    lock_path = state_dir / "stages" / "my_stage.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as f:
+        yaml.dump(lock_data, f)
+
+    state_db = state_mod.StateDB(state_dir)
+
+    result = await transfer._pull_async(
+        cache_dir,
+        state_dir,
+        s3_remote,
+        state_db,
+        "origin",
+        targets=["my_stage"],
+        all_stages=_helper_make_all_stages("my_stage"),
+    )
+
+    assert result["failed"] == 0, "Raw-input dep must not be fetched (no failed transfer)"
+    files_dir = cache_dir / "files"
+    assert cache_mod.get_cache_path(files_dir, out_hash).read_bytes() == b"main_file"
+    assert not cache_mod.get_cache_path(files_dir, dep_hash).exists()
     state_db.close()
 
 

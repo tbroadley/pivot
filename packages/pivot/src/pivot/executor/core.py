@@ -385,7 +385,14 @@ def _restore_tracked_file(
 
 
 def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
-    """Verify all .pvt tracked files exist and warn on hash mismatches.
+    """Verify all .pvt tracked files exist, restoring them from cache if asked.
+
+    Presence only: this deliberately does not hash the tracked content. Doing so cost
+    O(all tracked bytes) on every run -- the whole project, not just the deps of the
+    stages being run -- to produce a warning that changed nothing. Drift between a .pvt
+    pointer and a stage that depends on it is still caught, by comparing the pointer's
+    recorded hash against the lock file (see ``explain`` / ``status``, which read .pvt
+    hashes for deps that are missing from the workspace).
 
     Args:
         project_root: Project root directory.
@@ -402,36 +409,18 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
-        for data_path, track_data in tracked_files.items():
-            path = pathlib.Path(data_path)
+    for data_path, track_data in tracked_files.items():
+        path = pathlib.Path(data_path)
+        if path.is_file() or path.is_dir():
+            continue
 
-            # Try to hash the file - handles race conditions where file disappears
-            try:
-                if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db)
-                elif path.is_dir():
-                    current_hash, _ = cache.hash_directory(path, state_db)
-                else:
-                    # Path doesn't exist
-                    raise FileNotFoundError(data_path)
-            except FileNotFoundError:
-                if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir):
-                        logger.info(f"Restored tracked file: {data_path}")
-                    else:
-                        logger.debug(f"Failed to restore tracked file from cache: {data_path}")
-                        missing.append(data_path)
-                else:
-                    missing.append(data_path)
-                continue
+        if checkout_missing and _restore_tracked_file(path, track_data, cache_dir):
+            logger.info(f"Restored tracked file: {data_path}")
+            continue
 
-            # Check hash mismatch (file exists but content changed)
-            if current_hash != track_data["hash"]:
-                logger.warning(
-                    f"Tracked file '{data_path}' has changed since tracking. "
-                    + f"Run 'pivot track --force {track_data['path']}' to update."
-                )
+        if checkout_missing:
+            logger.debug(f"Failed to restore tracked file from cache: {data_path}")
+        missing.append(data_path)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

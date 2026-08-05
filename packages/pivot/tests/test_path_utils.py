@@ -72,3 +72,43 @@ def test_canonicalize_artifact_path_dotdot_normalized(tmp_path: Path) -> None:
     """Parent traversal is collapsed."""
     result = path_utils.canonicalize_artifact_path("sub/../data/input.csv", tmp_path)
     assert result == str(tmp_path / "data" / "input.csv")
+
+
+def test_make_exclude_matcher_empty_returns_none() -> None:
+    """No patterns (or slash-only patterns) yields no matcher."""
+    assert path_utils.make_exclude_matcher([]) is None
+    assert path_utils.make_exclude_matcher(["/", "///"]) is None
+
+
+def test_make_exclude_matcher_directory_prefix_and_exact() -> None:
+    """A pattern matches an exact path or any path nested under it."""
+    matcher = path_utils.make_exclude_matcher(["data/raw/sensitive"])
+    assert matcher is not None
+    assert matcher("data/raw/sensitive")
+    assert matcher("data/raw/sensitive/scans")
+    assert matcher("data/raw/sensitive/scans/run1.json")
+
+
+def test_make_exclude_matcher_does_not_match_sibling_prefix() -> None:
+    """A name-prefix sibling is not excluded."""
+    matcher = path_utils.make_exclude_matcher(["data/raw/sensitive"])
+    assert matcher is not None
+    assert not matcher("data/raw/sensitive2")
+    assert not matcher("data/raw/sensitive2/x.csv")
+    assert not matcher("data/raw/public")
+
+
+def test_make_exclude_matcher_strips_surrounding_slashes() -> None:
+    """Leading/trailing slashes on patterns and paths are ignored."""
+    matcher = path_utils.make_exclude_matcher(["/data/raw/sensitive/"])
+    assert matcher is not None
+    assert matcher("data/raw/sensitive/scans/")
+
+
+def test_make_exclude_matcher_multiple_patterns() -> None:
+    """Any matching pattern excludes the path."""
+    matcher = path_utils.make_exclude_matcher(["a/b", "c/d"])
+    assert matcher is not None
+    assert matcher("a/b/x")
+    assert matcher("c/d")
+    assert not matcher("e/f")

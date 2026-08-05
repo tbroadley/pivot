@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import pathlib
 
 import click
@@ -129,7 +128,7 @@ def push(
     # project-level StateDB regardless of --all mode.
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Uploading", quiet=quiet) as progress,
     ):
         result = transfer.push(
             cache_dir,
@@ -141,6 +140,7 @@ def push(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:
@@ -164,6 +164,12 @@ def push(
 @click.option(
     "-j", "--jobs", type=click.IntRange(min=1), default=None, help="Parallel download jobs"
 )
+@click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="Exclude referenced paths matching PATTERN (project-relative prefix/exact; repeatable).",
+)
 @click.pass_context
 def fetch(
     ctx: click.Context,
@@ -171,12 +177,14 @@ def fetch(
     remote_name: str | None,
     dry_run: bool,
     jobs: int | None,
+    exclude: tuple[str, ...],
 ) -> None:
     """Fetch cached outputs from remote storage to local cache.
 
     TARGETS can be stage names or file paths. If specified, fetches those
-    outputs (and dependencies for stages). Otherwise, fetches all available
-    files from remote.
+    outputs (and dependencies for stages). Otherwise, fetches all files
+    referenced by the current project (stage outputs, dependencies, and tracked
+    files) -- not stale blobs left in the remote.
 
     This command only downloads to the local cache. Use 'pivot pull' to also
     restore files to your workspace, or 'pivot checkout' to restore from cache.
@@ -198,12 +206,9 @@ def fetch(
     targets_list = _get_targets_list(normalized)
 
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
+        needed = transfer.get_needed_hashes(
+            targets_list, state_dir, all_stages, project.get_project_root(), list(exclude)
+        )
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
@@ -213,7 +218,7 @@ def fetch(
 
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Downloading", quiet=quiet) as progress,
     ):
         result = transfer.pull(
             cache_dir,
@@ -225,6 +230,8 @@ def fetch(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            exclude_patterns=list(exclude),
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:
@@ -259,6 +266,12 @@ def fetch(
     default=None,
     help="Checkout mode for restoration (default: project config or hardlink)",
 )
+@click.option(
+    "--exclude",
+    "exclude",
+    multiple=True,
+    help="Exclude referenced paths matching PATTERN (project-relative prefix/exact; repeatable).",
+)
 @click.pass_context
 def pull(
     ctx: click.Context,
@@ -269,6 +282,7 @@ def pull(
     force: bool,
     only_missing: bool,
     checkout_mode: str | None,
+    exclude: tuple[str, ...],
 ) -> None:
     """Pull cached outputs from remote and restore to workspace.
 
@@ -276,7 +290,9 @@ def pull(
     This matches the behavior of 'git pull' and 'dvc pull'.
 
     TARGETS can be stage names or file paths. If specified, pulls those
-    outputs (and dependencies for stages). Otherwise, pulls all available files.
+    outputs (and dependencies for stages). Otherwise, pulls all files referenced
+    by the current project (stage outputs, dependencies, and tracked files) --
+    not stale blobs left in the remote.
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -306,12 +322,9 @@ def pull(
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(s3_remote.list_hashes())
+        needed = transfer.get_needed_hashes(
+            targets_list, state_dir, all_stages, project.get_project_root(), list(exclude)
+        )
 
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
@@ -322,7 +335,7 @@ def pull(
     # Step 1: Fetch from remote to cache
     with (
         state.StateDB(config.get_state_dir()) as state_db,
-        cli_helpers.TransferProgress("Downloaded", quiet=quiet) as progress,
+        cli_helpers.TransferProgress("Downloading", quiet=quiet) as progress,
     ):
         fetch_result = transfer.pull(
             cache_dir,
@@ -334,6 +347,8 @@ def pull(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            exclude_patterns=list(exclude),
+            byte_callback=progress.set_bytes,
         )
 
     if not quiet:
@@ -354,14 +369,14 @@ def pull(
     # Import here to avoid circular imports at module level
     from pivot.cli import checkout as checkout_mod
 
-    # Default to only_missing=True to avoid "already exists" errors
-    if not force and not only_missing:
-        only_missing = True
-
+    # Without --force or --only-missing, checkout uses its SAFE default: stale
+    # cache-backed files are updated, but files with untracked local changes are
+    # never clobbered -- checkout errors instead of destroying data.
     ctx.invoke(
         checkout_mod.checkout,
         targets=normalized,
         checkout_mode=checkout_mode,
         force=force,
         only_missing=only_missing,
+        exclude=exclude,
     )

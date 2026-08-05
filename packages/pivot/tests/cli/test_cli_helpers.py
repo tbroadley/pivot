@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import shutil
 import sys
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
@@ -58,6 +60,7 @@ class _HelperDummyBar:
     desc: str
     closed: bool
     refresh_calls: int
+    postfix: str
 
     def __init__(self) -> None:
         self.total = None
@@ -65,12 +68,16 @@ class _HelperDummyBar:
         self.desc = ""
         self.closed = False
         self.refresh_calls = 0
+        self.postfix = ""
 
     def refresh(self) -> None:
         self.refresh_calls += 1
 
     def update(self, n: int) -> None:
         self.n += n
+
+    def set_postfix_str(self, s: str, refresh: bool = True) -> None:
+        self.postfix = s
 
     def close(self) -> None:
         self.closed = True
@@ -88,6 +95,11 @@ def _helper_make_dummy_tqdm(
         return bar
 
     return _factory
+
+
+def _helper_fixed_terminal_size(*args: object, **kwargs: object) -> os.terminal_size:
+    """Signature-compatible stand-in for shutil.get_terminal_size (accepts `fallback`)."""
+    return os.terminal_size((120, 24))
 
 
 # =============================================================================
@@ -210,7 +222,50 @@ def test_transfer_progress_updates_bar(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert bar.total == 3
     assert bar.n == 2
-    assert bar.desc == "Uploaded another.txt"
+    assert bar.desc.startswith("Uploaded another.txt")
+
+
+def test_fit_filename_pads_short_names() -> None:
+    """Short names are right-padded to exactly the requested width."""
+    assert cli_helpers._fit_filename("a.csv", 10) == "a.csv     "
+
+
+def test_fit_filename_truncates_long_names_keeping_tail() -> None:
+    """Long paths are elided from the head so the file name stays visible."""
+    long_path = "data/raw/scans/scan_id=abc123/measurement_v3.parquet"
+    fitted = cli_helpers._fit_filename(long_path, 20)
+
+    assert len(fitted) == 20
+    assert fitted.startswith("…")
+    assert fitted[1:] == long_path[-19:]
+
+
+def test_filename_field_width_clamped_to_bounds() -> None:
+    """Width tracks terminal size but never escapes the configured bounds."""
+    assert cli_helpers._filename_field_width(40, "Downloading") == cli_helpers._FILENAME_MIN_WIDTH
+    assert (
+        cli_helpers._filename_field_width(10_000, "Downloading") == cli_helpers._FILENAME_MAX_WIDTH
+    )
+
+
+def test_transfer_progress_prefix_width_is_stable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bar prefix is the same width regardless of filename length, so it won't jump."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    # The stand-in must accept the `fallback` kwarg: pytest's terminal reporter
+    # calls shutil.get_terminal_size(fallback=(80, 24)) while recomputing width, and
+    # a zero-arg replacement makes that raise TypeError inside a pytest hook, which
+    # under xdist kills the worker and aborts the whole run.
+    monkeypatch.setattr(shutil, "get_terminal_size", _helper_fixed_terminal_size)
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.callback(0, 2, "short.csv")
+    short_desc = bar.desc
+    progress.callback(1, 2, "data/raw/scans/scan_id=abc123/very_long_measurement_name_v3.parquet")
+    long_desc = bar.desc
+
+    assert len(short_desc) == len(long_desc)
 
 
 def test_transfer_progress_closes_bar(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,6 +278,43 @@ def test_transfer_progress_closes_bar(monkeypatch: pytest.MonkeyPatch) -> None:
         progress.callback(1, 1, "file.txt")
 
     assert bar.closed is True
+
+
+def test_transfer_progress_set_bytes_sets_postfix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes renders a human-readable size (and rate) postfix once the bar exists."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.callback(0, 2, "file.txt")  # creates the bar
+    refresh_before = bar.refresh_calls
+    progress.set_bytes(2_000_000)
+
+    assert "2.00MB" in bar.postfix
+    assert bar.refresh_calls > refresh_before, "set_bytes must repaint so the postfix climbs"
+
+
+def test_transfer_progress_set_bytes_noop_before_bar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes does nothing if no bar has been created yet."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading")
+    progress.set_bytes(1024)
+
+    assert progress._bar is None
+
+
+def test_transfer_progress_set_bytes_noop_when_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """set_bytes does nothing in quiet mode."""
+    bar = _HelperDummyBar()
+    monkeypatch.setattr(cli_helpers, "async_tqdm", _helper_make_dummy_tqdm(bar))
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    progress = cli_helpers.TransferProgress("Downloading", quiet=True)
+    progress.set_bytes(1024)
+
+    assert bar.postfix == ""
 
 
 # =============================================================================

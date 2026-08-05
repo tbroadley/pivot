@@ -198,8 +198,14 @@ All paths in lockfiles must be **relative** (to stage cwd), never absolute.
 
 ```bash
 uv sync --active                                                                      # Install deps
-uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto                  # Test
+./scripts/test.sh                                                                     # Test (both suites)
 uv run ruff format . && uv run ruff check . && uv run basedpyright                    # Quality
 ```
+
+The two suites **must be run as separate pytest processes** (see `scripts/test.sh`).
+A combined `pytest packages/pivot/tests packages/pivot-tui/tests` invocation fails:
+both packages have a `tests/` dir with `conftest.py`/`helpers.py`, and prepend
+import mode (required by pivot's stage discovery) collides on the `tests.conftest`
+module name. To run one suite directly: `uv run pytest packages/pivot/tests -n auto`.
 
 **Run all quality checks before returning to user or pushing.**

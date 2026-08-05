@@ -54,6 +54,71 @@ def test_extract_file_hashes_from_dir_hash_empty_manifest() -> None:
 
 
 # =============================================================================
+# Unit tests for _expand_hash_info_paths / build_hash_path_index
+# =============================================================================
+
+
+def test_expand_hash_info_paths_file_hash() -> None:
+    """A FileHash maps its blob hash to the given base path."""
+    fh = FileHash(hash="1111111111111111")
+    assert sync._expand_hash_info_paths(fh, "data/out.csv") == {"1111111111111111": "data/out.csv"}
+
+
+def test_expand_hash_info_paths_dir_hash() -> None:
+    """A DirHash maps each manifest entry hash to base_path/relpath (not the tree hash)."""
+    dh = DirHash(
+        hash="aaaaaaaaaaaaaaaa",
+        manifest=[
+            DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=1, isexec=False),
+            DirManifestEntry(relpath="sub/b.csv", hash="2222222222222222", size=1, isexec=False),
+        ],
+    )
+    assert sync._expand_hash_info_paths(dh, "out_dir") == {
+        "1111111111111111": "out_dir/a.csv",
+        "2222222222222222": "out_dir/sub/b.csv",
+    }
+
+
+def test_build_hash_path_index_maps_outputs_deps_and_pvt(set_project_root: pathlib.Path) -> None:
+    """The index maps blob hashes from stage outputs, deps, and .pvt files to rel paths."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir_hash = DirHash(
+        hash="aaaaaaaaaaaaaaaa",
+        manifest=[
+            DirManifestEntry(relpath="part.csv", hash="1111111111111111", size=1, isexec=False)
+        ],
+    )
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={str(set_project_root / "in.csv"): FileHash(hash="3333333333333333")},
+        output_hashes={
+            str(set_project_root / "output.csv"): FileHash(hash="2222222222222222"),
+            str(set_project_root / "out_dir"): out_dir_hash,
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="4444444444444444", size=10),
+    )
+
+    all_stages = {
+        "my_stage": RegistryStageInfo(state_dir=None, outs=[])  # pyright: ignore[reportCallIssue] - partial for test
+    }
+    index = sync.build_hash_path_index(state_dir, all_stages, set_project_root)
+
+    assert index["2222222222222222"] == "output.csv"
+    assert index["3333333333333333"] == "in.csv"
+    assert index["1111111111111111"] == "out_dir/part.csv"
+    assert index["4444444444444444"] == "data.csv"
+
+
+# =============================================================================
 # Integration tests for get_stage_output_hashes / get_stage_dep_hashes
 # =============================================================================
 
@@ -257,6 +322,117 @@ def test_get_target_hashes_file_target_excludes_noncached(
 
 
 # =============================================================================
+# get_referenced_hashes / get_needed_hashes
+# =============================================================================
+
+
+def _helper_stage_with_outs(*outs: outputs_mod.BaseOut) -> RegistryStageInfo:
+    return RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+        state_dir=None,
+        outs=[outputs_mod.require_expanded(out) for out in outs],
+    )
+
+
+def test_get_referenced_hashes_excludes_raw_input_deps_and_noncached(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Referenced hashes include cached outputs, but not cache=False outputs nor
+    raw-input deps (whose contents are never cached/pushed)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    cached_out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    metric_out = outputs_mod.Metric(path=str(set_project_root / "metrics.json"))
+    all_stages = {"my_stage": _helper_stage_with_outs(cached_out, metric_out)}
+
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={str(set_project_root / "in.csv"): FileHash(hash="3333333333333333")},
+        output_hashes={
+            str(set_project_root / "output.csv"): FileHash(hash="1111111111111111"),
+            str(set_project_root / "metrics.json"): FileHash(hash="2222222222222222"),
+        },
+    )
+    lock.StageLock("my_stage", stages_dir).write(lock_data)
+
+    result = sync.get_referenced_hashes(state_dir, all_stages, set_project_root)
+
+    assert result == {"1111111111111111"}
+
+
+def test_get_referenced_hashes_includes_tracked_files(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Referenced hashes include .pvt-tracked file hashes."""
+    state_dir = set_project_root / ".pivot"
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="abababababababab", size=10),
+    )
+
+    result = sync.get_referenced_hashes(state_dir, None, set_project_root)
+
+    assert result == {"abababababababab"}
+
+
+def test_get_referenced_hashes_ignores_unregistered_stage_lock(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A lock file for a stage absent from the registry is not pulled (stale state)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={str(set_project_root / "old.csv"): FileHash(hash="deaddeaddeaddead")},
+    )
+    lock.StageLock("removed_stage", stages_dir).write(lock_data)
+
+    result = sync.get_referenced_hashes(state_dir, {}, set_project_root)
+
+    assert result == set()
+
+
+def test_get_needed_hashes_delegates_to_target_hashes(
+    set_project_root: pathlib.Path,
+) -> None:
+    """With targets, get_needed_hashes resolves only those targets (not all references)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "output.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"my_stage": _helper_stage_with_outs(out)}
+    lock.StageLock("my_stage", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={str(set_project_root / "output.csv"): FileHash(hash="1111111111111111")},
+        )
+    )
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="abababababababab", size=10),
+    )
+
+    targeted = sync.get_needed_hashes(["my_stage"], state_dir, all_stages, set_project_root)
+    assert targeted == {"1111111111111111"}, "Targets should not include unrelated tracked files"
+
+    all_refs = sync.get_needed_hashes(None, state_dir, all_stages, set_project_root)
+    assert all_refs == {"1111111111111111", "abababababababab"}
+
+
+# =============================================================================
 # Task 3: Push skips directory cache paths
 # =============================================================================
 
@@ -403,3 +579,391 @@ def test_get_target_hashes_unresolved_file_target_returns_empty(
     )
 
     assert result == set(), "Unresolved target should return empty set, not crash"
+
+
+# =============================================================================
+# Exclusion via --exclude patterns
+# =============================================================================
+
+
+def test_exclude_drops_dependency_hash(set_project_root: pathlib.Path) -> None:
+    """Excluding a dep path drops its hash (the combine_runs deps leak)."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"combine_runs": _helper_stage_with_outs(out)}
+    lock.StageLock("combine_runs", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={
+                str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="5ec5e7"),
+            },
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="0117")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"0117"}, "Excluded dep hash must not be accumulated; output stays"
+
+
+def test_exclude_drops_output_and_tracked_pvt(set_project_root: pathlib.Path) -> None:
+    """Excluding a path drops both stage outputs and standalone .pvt files under it."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    keep_out = outputs_mod.Out(
+        path=str(set_project_root / "public/out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    drop_out = outputs_mod.Out(
+        path=str(set_project_root / "data/raw/sensitive/out.csv"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    all_stages = {"s": _helper_stage_with_outs(keep_out, drop_out)}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                str(set_project_root / "public/out.csv"): FileHash(hash="keep01"),
+                str(set_project_root / "data/raw/sensitive/out.csv"): FileHash(hash="drop01"),
+            },
+        )
+    )
+    track.write_pvt_file(
+        set_project_root / "data/raw/sensitive/transcript_annotation.pvt",
+        track.PvtData(path="transcript_annotation", hash="drop02", size=10),
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"keep01"}, "Excluded output and .pvt hashes must be dropped"
+
+
+def test_exclude_drops_directory_artifact_manifest(set_project_root: pathlib.Path) -> None:
+    """Excluding a directory artifact drops every file hash in its manifest."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    dir_hash = DirHash(
+        hash="treehash",
+        manifest=[
+            DirManifestEntry(relpath="a", hash="dir01", size=1, isexec=False),
+            DirManifestEntry(relpath="b", hash="dir02", size=2, isexec=False),
+        ],
+    )
+    all_stages = {"s": _helper_stage_with_outs()}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "data/raw/sensitive/scans"): dir_hash},
+            output_hashes={},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == set(), "All manifest hashes of an excluded directory must be dropped"
+
+
+def test_exclude_retains_hash_shared_with_nonexcluded_path(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A hash referenced by both an excluded and a non-excluded path is retained."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "public/copy.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"s": _helper_stage_with_outs(out)}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={
+                str(set_project_root / "data/raw/sensitive/orig.csv"): FileHash(hash="dup")
+            },
+            output_hashes={str(set_project_root / "public/copy.csv"): FileHash(hash="dup")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"dup"}, "Shared hash stays because the non-excluded path still references it"
+
+
+def test_exclude_prefix_does_not_match_sibling(set_project_root: pathlib.Path) -> None:
+    """`data/raw/sensitive` excludes nested paths but not a sibling like `sensitive2`."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    nested_out = outputs_mod.Out(
+        path=str(set_project_root / "data/raw/sensitive/scans"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    sibling_out = outputs_mod.Out(
+        path=str(set_project_root / "data/raw/sensitive2/x.csv"),
+        loader=loaders.PathOnly(),
+        cache=True,
+    )
+    all_stages = {"s": _helper_stage_with_outs(nested_out, sibling_out)}
+    lock.StageLock("s", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="nested"),
+                str(set_project_root / "data/raw/sensitive2/x.csv"): FileHash(hash="sibling"),
+            },
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        None, state_dir, all_stages, set_project_root, exclude_patterns=["data/raw/sensitive"]
+    )
+
+    assert result == {"sibling"}, "Sibling dir sharing a name prefix must not be excluded"
+
+
+def test_exclude_applies_with_explicit_targets(set_project_root: pathlib.Path) -> None:
+    """Exclusion also filters deps when explicit stage targets are given."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"combine_runs": _helper_stage_with_outs(out)}
+    lock.StageLock("combine_runs", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "data/raw/sensitive/scans"): FileHash(hash="dep01")},
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="out01")},
+        )
+    )
+
+    result = sync.get_needed_hashes(
+        ["combine_runs"],
+        state_dir,
+        all_stages,
+        set_project_root,
+        exclude_patterns=["data/raw/sensitive"],
+    )
+
+    assert result == {"out01"}, "Explicit-target pulls must also drop excluded deps"
+
+
+# =============================================================================
+# include_deps only fetches cacheable artifacts (issue #460)
+# =============================================================================
+
+
+def test_pull_excludes_raw_input_dep(set_project_root: pathlib.Path) -> None:
+    """A raw-input dep (not a stage output, not .pvt) is never fetched on pull."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"my_stage": _helper_stage_with_outs(out)}
+    lock.StageLock("my_stage", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "spec.yaml"): FileHash(hash="rawinput")},
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="out01")},
+        )
+    )
+
+    result = sync.get_needed_hashes(["my_stage"], state_dir, all_stages, set_project_root)
+
+    assert result == {"out01"}, "Raw-input dep hash must not be fetched"
+
+
+def test_pull_includes_upstream_cached_output_dep(set_project_root: pathlib.Path) -> None:
+    """A dep produced by an upstream cached stage is fetched on a targeted pull."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    upstream_out = outputs_mod.Out(
+        path=str(set_project_root / "upstream.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    downstream_out = outputs_mod.Out(
+        path=str(set_project_root / "downstream.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {
+        "upstream": _helper_stage_with_outs(upstream_out),
+        "downstream": _helper_stage_with_outs(downstream_out),
+    }
+    lock.StageLock("upstream", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={str(set_project_root / "upstream.csv"): FileHash(hash="upstream01")},
+        )
+    )
+    lock.StageLock("downstream", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "upstream.csv"): FileHash(hash="upstream01")},
+            output_hashes={str(set_project_root / "downstream.csv"): FileHash(hash="downstream01")},
+        )
+    )
+
+    result = sync.get_needed_hashes(["downstream"], state_dir, all_stages, set_project_root)
+
+    assert result == {"downstream01", "upstream01"}, "Upstream cached output dep must be fetched"
+
+
+def test_pull_includes_pvt_tracked_dep(set_project_root: pathlib.Path) -> None:
+    """A dep that is a .pvt-tracked artifact is fetched on a targeted pull."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    out = outputs_mod.Out(
+        path=str(set_project_root / "out.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {"my_stage": _helper_stage_with_outs(out)}
+    lock.StageLock("my_stage", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "data.csv"): FileHash(hash="tracked01")},
+            output_hashes={str(set_project_root / "out.csv"): FileHash(hash="out01")},
+        )
+    )
+    track.write_pvt_file(
+        set_project_root / "data.csv.pvt",
+        track.PvtData(path="data.csv", hash="tracked01", size=10),
+    )
+
+    result = sync.get_needed_hashes(["my_stage"], state_dir, all_stages, set_project_root)
+
+    assert result == {"out01", "tracked01"}, ".pvt-tracked dep must be fetched"
+
+
+def test_pull_excludes_dep_from_noncached_upstream_output(set_project_root: pathlib.Path) -> None:
+    """A dep produced by an upstream output with cache=False is not fetched."""
+    state_dir = set_project_root / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True, exist_ok=True)
+
+    upstream_out = outputs_mod.Out(
+        path=str(set_project_root / "upstream.csv"), loader=loaders.PathOnly(), cache=False
+    )
+    downstream_out = outputs_mod.Out(
+        path=str(set_project_root / "downstream.csv"), loader=loaders.PathOnly(), cache=True
+    )
+    all_stages = {
+        "upstream": _helper_stage_with_outs(upstream_out),
+        "downstream": _helper_stage_with_outs(downstream_out),
+    }
+    lock.StageLock("upstream", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={str(set_project_root / "upstream.csv"): FileHash(hash="upstream01")},
+        )
+    )
+    lock.StageLock("downstream", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={str(set_project_root / "upstream.csv"): FileHash(hash="upstream01")},
+            output_hashes={str(set_project_root / "downstream.csv"): FileHash(hash="downstream01")},
+        )
+    )
+
+    result = sync.get_needed_hashes(["downstream"], state_dir, all_stages, set_project_root)
+
+    assert result == {"downstream01"}, "Dep from a cache=False upstream output must not be fetched"
+
+
+# =============================================================================
+# partition_local_by_remote (used by pivot gc)
+# =============================================================================
+
+
+def test_partition_local_by_remote_splits_present_and_absent(mocker: MockerFixture) -> None:
+    """Blobs on the remote are removable; local-only blobs are protected."""
+    present = "1111111111111111"
+    absent = "2222222222222222"
+
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={present: True, absent: False})
+
+    removable, local_only = sync.partition_local_by_remote(
+        {present, absent}, mock_remote, mock_state, "origin"
+    )
+
+    assert removable == {present}
+    assert local_only == {absent}
+
+
+def test_partition_local_by_remote_clears_stale_index_on_url_change(
+    mocker: MockerFixture,
+) -> None:
+    """A changed remote URL clears the cached index before comparing existence."""
+    stale = "1111111111111111"
+
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_remote.url = "s3://new-bucket/cache"
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_get_url.return_value = "s3://old-bucket/cache"
+    mock_state.remote_hashes_intersection.return_value = set()
+    mock_remote.bulk_exists = mocker.AsyncMock(return_value={stale: False})
+
+    removable, local_only = sync.partition_local_by_remote(
+        {stale}, mock_remote, mock_state, "origin"
+    )
+
+    mock_state.remote_index_clear.assert_called_once_with("origin")
+    mock_state.remote_set_url.assert_called_once_with("origin", "s3://new-bucket/cache")
+    assert removable == set()
+    assert local_only == {stale}
+
+
+def test_partition_local_by_remote_empty_input(mocker: MockerFixture) -> None:
+    """Empty input avoids any remote calls."""
+    mock_remote = mocker.Mock(spec=remote_storage.S3Remote)
+    mock_state = mocker.Mock(spec=state_mod.StateDB)
+
+    removable, local_only = sync.partition_local_by_remote(set(), mock_remote, mock_state, "origin")
+
+    assert removable == set()
+    assert local_only == set()
+    mock_remote.bulk_exists.assert_not_called()

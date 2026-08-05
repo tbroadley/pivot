@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from botocore import exceptions as botocore_exc
 
-from pivot import exceptions
+from pivot import config, exceptions
 from pivot.remote import storage as remote_mod
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable
 
     from pytest_mock import MockerFixture
     from types_aiobotocore_s3 import S3Client
@@ -676,20 +677,60 @@ async def test_upload_batch(
     assert called_bodies == set(contents.values())
 
 
+def test_fractional_progress_fills_within_file() -> None:
+    """_FractionalProgress advances by byte fraction within a file, exact at finish."""
+    seen = list[float]()
+    progress = remote_mod._FractionalProgress(2, lambda c, _t, _i: seen.append(c), None)
+
+    progress.start("a")
+    progress.chunk("a", 50, 100)
+    progress.chunk("a", 50, 100)
+    progress.finish("a")
+    progress.start("b")
+    progress.chunk("b", 25, 100)
+    progress.finish("b")
+
+    assert seen == [0.0, 0.5, 1.0, 1.0, 1.0, 1.25, 2.0]
+
+
+def test_fractional_progress_handles_unknown_size() -> None:
+    """A file with no known total contributes nothing until it finishes (then +1)."""
+    seen = list[float]()
+    progress = remote_mod._FractionalProgress(1, lambda c, _t, _i: seen.append(c), None)
+
+    progress.start("a")
+    progress.chunk("a", 10, 0)
+    progress.finish("a")
+
+    assert seen == [0.0, 0.0, 1.0]
+
+
+def test_fractional_progress_byte_callback_accumulates() -> None:
+    """byte_callback receives the running cumulative byte total across files."""
+    byte_totals = list[int]()
+    progress = remote_mod._FractionalProgress(2, None, byte_totals.append)
+
+    progress.chunk("a", 100, 200)
+    progress.chunk("b", 50, 50)
+    progress.chunk("a", 100, 200)
+
+    assert byte_totals == [100, 150, 250]
+
+
 async def test_upload_batch_with_callback(
     s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """upload_batch calls callback for each completed upload."""
+    """upload_batch reports monotonic fractional progress reaching total files."""
     files = list[tuple[pathlib.Path, str]]()
     for i in range(3):
         f = tmp_path / f"file{i}.txt"
         f.write_text(f"content {i}")
         files.append((f, f"a{i}b2c3d4e5f6789a"))
 
-    callback_values = list[int]()
+    calls = list[tuple[float, int, str]]()
 
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
+    def callback(completed: float, total: int, ident: str) -> None:
+        calls.append((completed, total, ident))
 
     mock_client = mocker.AsyncMock()
     mock_client.put_object = mocker.AsyncMock(return_value={})
@@ -697,8 +738,41 @@ async def test_upload_batch_with_callback(
 
     await s3_remote.upload_batch(files, concurrency=1, callback=callback)
 
-    assert len(callback_values) == 3
-    assert set(callback_values) == {1, 2, 3}
+    assert calls, "callback should fire"
+    assert all(total == len(files) for _, total, _ in calls)
+    completed_values = [completed for completed, _, _ in calls]
+    assert completed_values == sorted(completed_values), "progress is monotonic non-decreasing"
+    assert completed_values[-1] == float(len(files)), "ends at exactly total files"
+    assert {ident for _, _, ident in calls} == {h for _, h in files}, (
+        "callback receives the full blob hash"
+    )
+
+
+async def test_upload_batch_with_byte_callback(
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """upload_batch reports cumulative bytes uploaded via byte_callback."""
+    files = list[tuple[pathlib.Path, str]]()
+    contents = [b"x" * (100 * (i + 1)) for i in range(3)]
+    for i, body in enumerate(contents):
+        f = tmp_path / f"file{i}.bin"
+        f.write_bytes(body)
+        files.append((f, f"a{i}b2c3d4e5f6789a"))
+
+    byte_values = list[int]()
+
+    def byte_callback(bytes_done: int) -> None:
+        byte_values.append(bytes_done)
+
+    mock_client = mocker.AsyncMock()
+    mock_client.put_object = mocker.AsyncMock(return_value={})
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    await s3_remote.upload_batch(files, concurrency=1, byte_callback=byte_callback)
+
+    assert byte_values, "byte_callback should fire as chunks stream out"
+    assert byte_values == sorted(byte_values), "cumulative bytes are non-decreasing"
+    assert byte_values[-1] == sum(len(b) for b in contents)
 
 
 async def test_upload_batch_empty() -> None:
@@ -853,7 +927,9 @@ async def test_download_file_mid_stream_error(
     call_count = 0
     real_stream_download = remote_mod._stream_download_to_fd
 
-    async def _inject_read_failure(response: Any, fd: int) -> None:
+    async def _inject_read_failure(
+        response: Any, fd: int, on_chunk: Callable[[int, int], None] | None = None
+    ) -> None:
         """Wrap stream.read to fail on second call, then delegate to real impl."""
         nonlocal call_count
         body = response["Body"]
@@ -867,7 +943,7 @@ async def test_download_file_mid_stream_error(
             return await original_read(amt)
 
         body.read = _failing_read
-        await real_stream_download(response, fd)
+        await real_stream_download(response, fd, on_chunk)
 
     monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_read_failure)
 
@@ -900,7 +976,9 @@ async def test_download_file_stream_read_timeout(
     real_stream_download = remote_mod._stream_download_to_fd
     hang_event = asyncio.Event()
 
-    async def _inject_hanging_read(response: Any, fd: int) -> None:
+    async def _inject_hanging_read(
+        response: Any, fd: int, on_chunk: Callable[[int, int], None] | None = None
+    ) -> None:
         body = response["Body"]
         original_read = body.read
         call_count = 0
@@ -913,7 +991,7 @@ async def test_download_file_stream_read_timeout(
             return await original_read(amt)
 
         body.read = _hanging_read
-        await real_stream_download(response, fd)
+        await real_stream_download(response, fd, on_chunk)
 
     monkeypatch.setattr(remote_mod, "_stream_download_to_fd", _inject_hanging_read)
 
@@ -931,7 +1009,7 @@ async def test_download_batch_with_callback(
     tmp_path: pathlib.Path,
     aioboto3_s3_client: S3Client,
 ) -> None:
-    """download_batch calls callback for each completed download."""
+    """download_batch reports monotonic fractional progress reaching total files."""
     items = [(f"a{i}b2c3d4e5f6789a", tmp_path / f"dest{i}.txt") for i in range(3)]
 
     for cache_hash, _ in items:
@@ -941,15 +1019,49 @@ async def test_download_batch_with_callback(
             Body=b"content",
         )
 
-    callback_values = list[int]()
+    calls = list[tuple[float, int, str]]()
 
-    def callback(completed: int, total: int, filename: str) -> None:
-        callback_values.append(completed)
+    def callback(completed: float, total: int, ident: str) -> None:
+        calls.append((completed, total, ident))
 
     await s3_remote.download_batch(items, concurrency=10, callback=callback)
 
-    assert len(callback_values) == 3
-    assert set(callback_values) == {1, 2, 3}
+    assert calls, "callback should fire"
+    assert all(total == len(items) for _, total, _ in calls)
+    completed_values = [completed for completed, _, _ in calls]
+    assert completed_values == sorted(completed_values), "progress is monotonic non-decreasing"
+    assert completed_values[-1] == float(len(items)), "ends at exactly total files"
+    assert {ident for _, _, ident in calls} == {h for h, _ in items}, (
+        "callback receives the full blob hash, not the truncated cache filename"
+    )
+
+
+async def test_download_batch_with_byte_callback(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """download_batch reports cumulative bytes downloaded via byte_callback."""
+    bodies = {f"a{i}b2c3d4e5f6789a": b"x" * (100 * (i + 1)) for i in range(3)}
+    items = [(h, tmp_path / f"dest{i}.txt") for i, h in enumerate(bodies)]
+
+    for cache_hash, body in bodies.items():
+        await aioboto3_s3_client.put_object(
+            Bucket=s3_remote.bucket,
+            Key=remote_mod._hash_to_key(s3_remote.prefix, cache_hash),
+            Body=body,
+        )
+
+    byte_values = list[int]()
+
+    def byte_callback(bytes_done: int) -> None:
+        byte_values.append(bytes_done)
+
+    await s3_remote.download_batch(items, concurrency=10, byte_callback=byte_callback)
+
+    assert byte_values, "byte_callback should fire as chunks stream in"
+    assert byte_values == sorted(byte_values), "cumulative bytes are non-decreasing"
+    assert byte_values[-1] == sum(len(b) for b in bodies.values())
 
 
 async def test_download_file_default_permissions(
@@ -1119,3 +1231,55 @@ def test_s3_remote_init_raises_on_missing_aioboto3(mocker: MockerFixture) -> Non
 
     with pytest.raises(exceptions.RemoteError, match="pip install pivot\\[s3\\]"):
         remote_mod.S3Remote("s3://bucket/prefix")
+
+
+# -----------------------------------------------------------------------------
+# S3 Client Config Tests
+# -----------------------------------------------------------------------------
+
+
+def test_get_s3_config_sizes_pool_to_remote_jobs(mocker: MockerFixture) -> None:
+    """max_pool_connections tracks remote.jobs so the pool never throttles concurrency."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=64)
+    try:
+        cfg = remote_mod._get_s3_config()
+        assert cfg.max_pool_connections == 64  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+    finally:
+        remote_mod._cached_s3_config = None
+
+
+def test_get_s3_config_pool_floors_at_default_concurrency(mocker: MockerFixture) -> None:
+    """A tiny remote.jobs still gets a pool at least DEFAULT_CONCURRENCY wide."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=2)
+    try:
+        cfg = remote_mod._get_s3_config()
+        assert cfg.max_pool_connections == remote_mod.DEFAULT_CONCURRENCY  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+    finally:
+        remote_mod._cached_s3_config = None
+
+
+def test_get_s3_config_pool_tracks_explicit_concurrency(mocker: MockerFixture) -> None:
+    """An explicit concurrency (e.g. from --jobs) sizes the pool, ignoring config."""
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    cfg = remote_mod._get_s3_config(100)
+    assert cfg.max_pool_connections == 100  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+
+
+def test_get_s3_config_explicit_concurrency_floors_at_default(mocker: MockerFixture) -> None:
+    """A small explicit concurrency still floors at DEFAULT_CONCURRENCY."""
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    cfg = remote_mod._get_s3_config(1)
+    assert cfg.max_pool_connections == remote_mod.DEFAULT_CONCURRENCY  # pyright: ignore[reportAttributeAccessIssue] - not in botocore stubs
+
+
+def test_get_s3_config_explicit_concurrency_is_not_cached(mocker: MockerFixture) -> None:
+    """Passing concurrency returns a fresh config and never populates the cache."""
+    remote_mod._cached_s3_config = None
+    mocker.patch.object(config, "get_remote_jobs", autospec=True, return_value=20)
+    try:
+        remote_mod._get_s3_config(100)
+        assert remote_mod._cached_s3_config is None
+    finally:
+        remote_mod._cached_s3_config = None

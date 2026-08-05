@@ -238,7 +238,7 @@ def test_import_pvt_roundtrip(tmp_path: pathlib.Path) -> None:
     assert loaded_source["repo"] == source["repo"]
     assert loaded_source["rev"] == source["rev"]
     assert loaded_source["rev_lock"] == source["rev_lock"]
-    assert loaded_source["stage"] == source["stage"]
+    assert loaded_source["stage"] == source["stage"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
     assert loaded_source["path"] == source["path"]
     assert loaded_source["remote"] == source["remote"]
 
@@ -349,7 +349,7 @@ async def test_import_from_local_git_repo(
     assert source["repo"] == str(source_dir)
     assert source["rev"] == "main"
     assert source["rev_lock"] == head_sha, "rev_lock should be resolved HEAD SHA"
-    assert source["stage"] == "prepare"
+    assert source["stage"] == "prepare"  # pyright: ignore[reportTypedDictNotRequiredAccess]
     assert source["path"] == "data/output.csv"
     assert source["remote"] == remote_url
 
@@ -485,6 +485,11 @@ async def test_full_import_flow_mocked(
         "pivot.import_artifact.github.list_directory",
         autospec=True,
         return_value=["train.lock"],
+    )
+    mocker.patch(
+        "pivot.import_artifact.github.list_tree",
+        autospec=True,
+        return_value=[],
     )
     resolve_ref_mock = mocker.patch(
         "pivot.import_artifact.github.resolve_ref",

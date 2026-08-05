@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import stat
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 import dulwich.errors
@@ -13,7 +14,7 @@ import dulwich.repo
 from pivot import project
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -280,7 +281,9 @@ def _list_tree_files(
 
         full_path = f"{prefix}/{name}" if prefix else name
 
-        if entry.mode & 0o40000:
+        # Exact directory-mode test: a bitwise ``& 0o40000`` also matches submodule
+        # gitlinks (mode 0o160000), whose SHA is a commit not in this object store.
+        if stat.S_ISDIR(entry.mode):
             result.extend(_list_tree_files(repo, entry.sha, full_path, pattern))
         elif fnmatch.fnmatch(name, pattern):
             result.append(full_path)
@@ -306,3 +309,94 @@ def list_files_at_revision(directory: str, rev: str, pattern: str = "*") -> list
 
     files = _list_tree_files(ctx.repo, dir_sha, "", pattern)
     return [f"{directory}/{f}" for f in files]
+
+
+def _collect_tree_blob_shas(
+    repo: dulwich.repo.Repo,
+    tree_sha: bytes,
+    prefix: str,
+    pattern: str,
+    out: dict[str, bytes],
+) -> None:
+    """Recursively map matching file paths to their git blob SHAs (no blob reads)."""
+    tree = repo[tree_sha]
+    if not isinstance(tree, dulwich.objects.Tree):
+        return
+    for entry in tree.items():
+        try:
+            name = entry.path.decode()
+        except UnicodeDecodeError:
+            logger.debug(f"Skipping non-UTF8 filename: {entry.path!r}")
+            continue
+        full_path = f"{prefix}/{name}" if prefix else name
+        # Exact directory-mode test (see _list_tree_files): a bitwise ``& 0o40000``
+        # also matches submodule gitlinks (mode 0o160000), whose SHA is a commit
+        # absent from this object store, which would crash ``repo[tree_sha]``.
+        if stat.S_ISDIR(entry.mode):
+            _collect_tree_blob_shas(repo, entry.sha, full_path, pattern, out)
+        elif fnmatch.fnmatch(name, pattern):
+            out[full_path] = entry.sha
+
+
+def read_matching_blobs_across_revisions(
+    revs: Sequence[str], directory: str, pattern: str = "*"
+) -> Iterator[bytes]:
+    """Yield the bytes of each distinct blob matching pattern under directory.
+
+    Scans every revision in ``revs`` but reads each unique blob (by git SHA) only
+    once, so files unchanged across branches -- e.g. identical lock files -- are
+    parsed a single time. ``directory`` is project-relative; an empty string
+    scans the whole project tree. Opens the repo once. Yields nothing if not in a
+    git repo.
+    """
+    result = _open_repo()
+    if result is None:
+        return
+
+    repo, git_root, proj_root = result
+    proj_prefix = _get_proj_prefix(git_root, proj_root)
+    seen = set[bytes]()
+
+    for rev in revs:
+        sha_hex = _resolve_revision_with_repo(repo, rev)
+        if sha_hex is None:
+            continue
+        commit = repo[sha_hex.encode()]
+        if not isinstance(commit, dulwich.objects.Commit):
+            continue
+
+        subtree = _resolve_path(proj_prefix, directory) if (directory or proj_prefix) else None
+        if subtree:
+            try:
+                _mode, tree_sha = dulwich.object_store.tree_lookup_path(
+                    repo.__getitem__, commit.tree, subtree.encode()
+                )
+            except KeyError:
+                continue
+        else:
+            tree_sha = commit.tree
+
+        blobs = dict[str, bytes]()
+        _collect_tree_blob_shas(repo, tree_sha, "", pattern, blobs)
+        for blob_sha in blobs.values():
+            if blob_sha in seen:
+                continue
+            seen.add(blob_sha)
+            obj = repo[blob_sha]
+            if isinstance(obj, dulwich.objects.Blob):
+                yield obj.data
+
+
+def list_local_branches() -> list[str]:
+    """Return local branch short names (empty list if not a git repo)."""
+    result = _open_repo()
+    if result is None:
+        return []
+
+    repo, _git_root, _proj_root = result
+    prefix = b"refs/heads/"
+    branches = list[str]()
+    for ref in repo.get_refs():
+        if ref.startswith(prefix):
+            branches.append(ref[len(prefix) :].decode())
+    return branches

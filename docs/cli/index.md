@@ -22,6 +22,7 @@ Complete reference for all Pivot command-line commands.
 | Push outputs to remote | `pivot push` |
 | Fetch to local cache | `pivot fetch` |
 | Pull outputs from remote | `pivot pull` |
+| Free unreferenced cache blobs | `pivot gc` |
 | Reset fingerprint cache | `pivot fingerprint reset` |
 | Watch for changes | `pivot repro --watch` |
 
@@ -682,6 +683,38 @@ pivot fetch [TARGETS...] [OPTIONS]
 | `--dry-run` / `-n` | Show what would be fetched |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--all` | Fetch all stages (ignore target filtering) |
+
+---
+
+### `pivot gc`
+
+Remove local cache blobs that no live reference points to. The referenced ("live") set is every cached stage output and dependency in the lock files, plus every `.pvt`-tracked file. By default the live set spans **all linked worktrees and local branches** of the repo, so collecting from one worktree never deletes another's data; `--workspace` narrows it to the current checkout.
+
+A blob is deleted only if it also exists on the remote, so pushed data can always be re-fetched and local-only (unpushed) blobs are never lost. This requires a configured remote.
+
+```bash
+pivot gc [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--workspace` | Scope to the current checkout instead of all worktrees + local branches |
+| `--dry-run` / `-n` | Show what would be removed without deleting |
+| `--yes` / `-y` | Skip the confirmation prompt |
+| `--remote` / `-r NAME` | Remote to verify against (uses default if not specified) |
+| `--jobs` / `-j N` | Parallel jobs for remote existence checks |
+
+**Examples:**
+
+```bash
+# Preview what would be freed, keeping every worktree's data
+pivot gc --dry-run
+
+# Collect, scoped to just the current checkout
+pivot gc --workspace
+```
 
 ---
 
