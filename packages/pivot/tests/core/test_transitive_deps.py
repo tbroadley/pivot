@@ -41,9 +41,9 @@ def test_direct_call_captures_transitive() -> None:
     manifest = fingerprint.get_stage_fingerprint(stage_direct_call)
 
     assert "self:stage_direct_call" in manifest
-    assert "func:helper_top" in manifest
-    assert "func:helper_middle" in manifest
-    assert "func:helper_leaf" in manifest
+    assert "func:test_transitive_deps.helper_top" in manifest
+    assert "func:test_transitive_deps.helper_middle" in manifest
+    assert "func:test_transitive_deps.helper_leaf" in manifest
 
 
 def test_global_constant_captured() -> None:
@@ -53,8 +53,8 @@ def test_global_constant_captured() -> None:
 
     manifest = fingerprint.get_stage_fingerprint(stage_with_constant)
 
-    assert "const:GLOBAL_CONSTANT" in manifest
-    assert manifest["const:GLOBAL_CONSTANT"] == "42"
+    assert "const:test_transitive_deps.GLOBAL_CONSTANT" in manifest
+    assert manifest["const:test_transitive_deps.GLOBAL_CONSTANT"] == "42"
 
 
 def test_aliasing_works() -> None:
@@ -64,9 +64,9 @@ def test_aliasing_works() -> None:
 
     manifest = fingerprint.get_stage_fingerprint(stage_with_alias)
 
-    assert "func:helper_top" in manifest
-    assert "func:helper_middle" in manifest
-    assert "func:helper_leaf" in manifest
+    assert "func:test_transitive_deps.helper_top" in manifest
+    assert "func:test_transitive_deps.helper_middle" in manifest
+    assert "func:test_transitive_deps.helper_leaf" in manifest
 
 
 def test_module_attr_google_style() -> None:

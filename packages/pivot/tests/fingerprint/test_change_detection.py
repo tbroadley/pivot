@@ -115,13 +115,13 @@ def test_helper_via_direct_import_change_causes_miss(module_dir: pathlib.Path) -
 
     mod = _import_fresh("test_change_stage_direct")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["func:helper"]
+    hash1 = fp1["func:test_change_helpers_direct.helper"]
 
     helpers_py.write_text("def helper(x):\n    return x * 3\n")
     _import_fresh("test_change_helpers_direct")
     mod = _import_fresh("test_change_stage_direct")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["func:helper"]
+    hash2 = fp2["func:test_change_helpers_direct.helper"]
 
     assert hash1 != hash2, "Direct import helper change must cause cache miss"
 
@@ -138,13 +138,13 @@ def test_helper_via_module_attr_change_causes_miss(module_dir: pathlib.Path) -> 
 
     mod = _import_fresh("test_change_stage_mod")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:helpers.helper"]
+    hash1 = fp1["mod:test_change_helpers_mod.helper"]
 
     helpers_py.write_text("def helper(x):\n    return x * 3\n")
     _import_fresh("test_change_helpers_mod")
     mod = _import_fresh("test_change_stage_mod")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:helpers.helper"]
+    hash2 = fp2["mod:test_change_helpers_mod.helper"]
 
     assert hash1 != hash2, "Module attr helper change must cause cache miss"
 
@@ -166,14 +166,14 @@ def test_transitive_dependency_change_causes_miss(module_dir: pathlib.Path) -> N
 
     mod = _import_fresh("test_change_stage_trans")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["mod:leaf_mod.leaf"]
+    hash1 = fp1["mod:test_change_leaf.leaf"]
 
     leaf_py.write_text("def leaf(x):\n    return x + 100\n")
     for m in ["test_change_leaf", "test_change_middle", "test_change_stage_trans"]:
         _import_fresh(m)
     mod = _import_fresh("test_change_stage_trans")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["mod:leaf_mod.leaf"]
+    hash2 = fp2["mod:test_change_leaf.leaf"]
 
     assert hash1 != hash2, "Transitive dependency change must cause cache miss"
 
@@ -191,8 +191,8 @@ def test_module_constant_captured_via_module_attr(module_dir: pathlib.Path) -> N
     mod = _import_fresh("test_change_stage_const")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "mod:config.THRESHOLD" in fp, "Module constant should be captured"
-    assert fp["mod:config.THRESHOLD"] == "0.5", "Constant value should be repr"
+    assert "mod:test_change_config.THRESHOLD" in fp, "Module constant should be captured"
+    assert fp["mod:test_change_config.THRESHOLD"] == "0.5", "Constant value should be repr"
 
 
 def test_global_constant_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -202,12 +202,12 @@ def test_global_constant_change_causes_miss(module_dir: pathlib.Path) -> None:
 
     mod = _import_fresh("test_change_global")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    val1 = fp1["const:MULTIPLIER"]
+    val1 = fp1["const:test_change_global.MULTIPLIER"]
 
     mod_py.write_text("MULTIPLIER = 10\n\ndef stage(x):\n    return x * MULTIPLIER\n")
     mod = _import_fresh("test_change_global")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    val2 = fp2["const:MULTIPLIER"]
+    val2 = fp2["const:test_change_global.MULTIPLIER"]
 
     assert val1 == "2"
     assert val2 == "10"
@@ -362,7 +362,9 @@ def test_underscore_helper_change_detected(module_dir: pathlib.Path) -> None:
     mod = _import_fresh("test_limit_stage_us")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:_private_helper" in fp, "Should capture underscore-prefixed helpers"
+    assert "func:test_limit_helpers_us._private_helper" in fp, (
+        "Should capture underscore-prefixed helpers"
+    )
 
 
 @pytest.mark.xfail(reason="Lazy imports inside function body not analyzed by getclosurevars()")
@@ -424,9 +426,9 @@ def test_dynamic_dispatch_change_detected(
     mod = _import_fresh("test_limit_stage_dyn")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    # Collection callables are tracked with key format: func:COLLECTION_NAME['key']
-    assert "func:FUNCS['add']" in fp, "Should capture functions in dispatch dicts"
-    assert "func:FUNCS['mul']" in fp, "Should capture functions in dispatch dicts"
+    # Collection callables are keyed by their definition site, not by collection position
+    assert "func:test_limit_helpers_dyn.add" in fp, "Should capture functions in dispatch dicts"
+    assert "func:test_limit_helpers_dyn.mul" in fp, "Should capture functions in dispatch dicts"
 
 
 # =============================================================================
@@ -497,7 +499,7 @@ def test_dispatch_dict_function_change_causes_miss(
 
     mod = _import_fresh("test_dispatch_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash1 = fp1["func:FUNCS['add']"]
+    hash1 = fp1["func:test_dispatch_helpers.add"]
 
     # Change the add function
     helpers_py.write_text(
@@ -508,7 +510,7 @@ def test_dispatch_dict_function_change_causes_miss(
     _import_fresh("test_dispatch_helpers")
     mod = _import_fresh("test_dispatch_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
-    hash2 = fp2["func:FUNCS['add']"]
+    hash2 = fp2["func:test_dispatch_helpers.add"]
 
     assert hash1 != hash2, "Dispatch dict function change must cause cache miss"
 
@@ -535,8 +537,8 @@ def test_list_callable_tracking(module_dir: pathlib.Path, monkeypatch: pytest.Mo
     mod = _import_fresh("test_list_stage")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:PIPELINE[0]" in fp, "Should capture first function in list"
-    assert "func:PIPELINE[1]" in fp, "Should capture second function in list"
+    assert "func:test_list_helpers.step1" in fp, "Should capture first function in list"
+    assert "func:test_list_helpers.step2" in fp, "Should capture second function in list"
 
 
 def test_fingerprint_ordering_stability(
@@ -595,7 +597,7 @@ def test_class_definition_tracked_with_class_prefix(module_dir: pathlib.Path) ->
     mod = _import_fresh("test_class_stage")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "class:MyProcessor" in fp, "Should capture class with 'class:' prefix"
+    assert "class:test_class_helpers.MyProcessor" in fp, "Should capture class with 'class:' prefix"
     assert "func:MyProcessor" not in fp, "Should NOT use 'func:' prefix for classes"
 
 
@@ -644,7 +646,7 @@ def test_class_instance_tracked(module_dir: pathlib.Path, monkeypatch: pytest.Mo
     mod = _import_fresh("test_instance_stage")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "class:processor.__class__" in fp, "Should capture instance's class"
+    assert "class:test_instance_helpers.Processor" in fp, "Should capture instance's class"
 
 
 def test_class_instance_change_causes_miss(
@@ -704,7 +706,7 @@ def test_nonlocal_class_instance_tracked(
     mod = _import_fresh("test_nonlocal_helpers")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "class:processor.__class__" in fp, "Should capture nonlocal instance's class"
+    assert "class:test_nonlocal_helpers.Processor" in fp, "Should capture nonlocal instance's class"
 
 
 # =============================================================================
@@ -743,7 +745,7 @@ def stage(params: MyParams) -> int:
     mod = _import_fresh("test_params_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
+    assert fp1["class:test_params_prop.MyParams"] != fp2["class:test_params_prop.MyParams"], (
         "@property change on StageParams must cause cache miss"
     )
 
@@ -777,7 +779,7 @@ def stage(params: MyParams) -> int:
     mod = _import_fresh("test_params_method_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
+    assert fp1["class:test_params_method.MyParams"] != fp2["class:test_params_method.MyParams"], (
         "Method change on StageParams must cause cache miss"
     )
 
@@ -810,9 +812,9 @@ def stage(params: MyParams) -> str:
     mod = _import_fresh("test_params_classvar_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["class:MyParams"] != fp2["class:MyParams"], (
-        "Class variable change on StageParams must cause cache miss"
-    )
+    assert (
+        fp1["class:test_params_classvar.MyParams"] != fp2["class:test_params_classvar.MyParams"]
+    ), "Class variable change on StageParams must cause cache miss"
 
 
 # =============================================================================
@@ -840,7 +842,7 @@ def stage():
     mod = _import_fresh("test_nested_global_ref")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:helper" in fp, "Nested global helper should be captured"
+    assert "func:test_nested_global_ref.helper" in fp, "Nested global helper should be captured"
 
 
 def test_nested_function_global_change_causes_miss(module_dir: pathlib.Path) -> None:
@@ -907,8 +909,8 @@ def stage():
     mod = _import_fresh("test_nested_deep")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:leaf" in fp, "Deeply nested leaf should be captured"
-    assert "func:tweak" in fp, "Deeply nested tweak should be captured"
+    assert "func:test_nested_deep.leaf" in fp, "Deeply nested leaf should be captured"
+    assert "func:test_nested_deep.tweak" in fp, "Deeply nested tweak should be captured"
 
 
 def test_nested_lambda_global_detected(module_dir: pathlib.Path) -> None:
@@ -930,7 +932,7 @@ def stage():
     mod = _import_fresh("test_nested_lambda")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert "func:processor" in fp, "Nested lambda global should be captured"
+    assert "func:test_nested_lambda.processor" in fp, "Nested lambda global should be captured"
 
 
 def test_nested_function_builtin_not_tracked(module_dir: pathlib.Path) -> None:
@@ -990,7 +992,7 @@ def stage():
     # 'upper' is over-included because co_names contains attribute access names
     # and __globals__ has a function with the same name. This is benign:
     # over-invalidation is safe, under-invalidation is catastrophic.
-    assert "func:upper" in fp, (
+    assert "func:test_nested_attr_collision.upper" in fp, (
         "Attribute name colliding with global should be over-included (benign)"
     )
 
@@ -1025,7 +1027,9 @@ def test_dataclass_method_transitive_dependency_change_causes_miss(
     assert any(k.startswith("method:") and k.endswith(".Cfg.compute") for k in fp1), (
         "Data class method should be fingerprinted"
     )
-    assert "func:dep" in fp1, "Method's transitive dependency should be followed"
+    assert "func:test_change_dcmethod_helpers.dep" in fp1, (
+        "Method's transitive dependency should be followed"
+    )
 
     helpers_py.write_text(template.format(n=999))
     _import_fresh("test_change_dcmethod_helpers")
@@ -1052,7 +1056,9 @@ def test_enum_member_selection_change_causes_miss(module_dir: pathlib.Path) -> N
 
     mod = _import_fresh("test_change_enum_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert fp1["enum:DEFAULT"] == "Basis.FRONTIER", "Captured enum member should be tracked"
+    assert fp1["enum:test_change_enum_stage.DEFAULT"] == "Basis.FRONTIER", (
+        "Captured enum member should be tracked"
+    )
 
     helpers_py.write_text(template.format(member="HEAD"))
     _import_fresh("test_change_enum_helpers")
@@ -1096,7 +1102,9 @@ def test_tuple_constant_content_change_causes_miss(module_dir: pathlib.Path) -> 
 
     mod = _import_fresh("test_change_tuple_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "const:CONDITIONS" in fp1, "Primitive tuple constant should be content-hashed"
+    assert "const:test_change_tuple_stage.CONDITIONS" in fp1, (
+        "Primitive tuple constant should be content-hashed"
+    )
 
     # Same length, different value (and different source size to defeat .pyc mtime cache).
     helpers_py.write_text('CONDITIONS = ("frontier", "visible")\n')
@@ -1126,7 +1134,9 @@ def test_shared_nested_tuple_constant_change_causes_miss(module_dir: pathlib.Pat
 
     mod = _import_fresh("test_change_shared_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "const:CONFIG" in fp1, "Tuple with a shared inner tuple should be content-hashed"
+    assert "const:test_change_shared_stage.CONFIG" in fp1, (
+        "Tuple with a shared inner tuple should be content-hashed"
+    )
 
     helpers_py.write_text(template.format(v="b"))
     _import_fresh("test_change_shared_helpers")
@@ -1153,8 +1163,12 @@ def test_enum_tuple_member_selection_change_causes_miss(module_dir: pathlib.Path
 
     mod = _import_fresh("test_change_enumtup_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "const:EXCLUDE" in fp1, "Tuple of enums should be content-hashed"
-    assert fp1["enum:EXCLUDE[1]"] == "Basis.HEAD", "Each enum member should be tracked"
+    assert "const:test_change_enumtup_stage.EXCLUDE" in fp1, (
+        "Tuple of enums should be content-hashed"
+    )
+    assert fp1["enum:test_change_enumtup_stage.EXCLUDE[1]"] == "Basis.HEAD", (
+        "Each enum member should be tracked"
+    )
 
     helpers_py.write_text(template.format(member="ALL"))
     _import_fresh("test_change_enumtup_helpers")
@@ -1184,7 +1198,7 @@ def test_dispatch_dict_enum_value_change_causes_miss(
 
     mod = _import_fresh("test_dispatch_enum_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert fp1["enum:DISPATCH['a']"] == "Basis.FRONTIER", (
+    assert fp1["enum:test_dispatch_enum_stage.DISPATCH['a']"] == "Basis.FRONTIER", (
         "Dict-valued enum member should be tracked"
     )
 
@@ -1239,7 +1253,9 @@ def test_frozen_instance_tuple_field_change_causes_miss(module_dir: pathlib.Path
 
     mod = _import_fresh("test_change_frozentup_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "const:STYLES" in fp1, "Tuple holding a frozen dataclass should be content-hashed"
+    assert "const:test_change_frozentup_stage.STYLES" in fp1, (
+        "Tuple holding a frozen dataclass should be content-hashed"
+    )
 
     helpers_py.write_text(template.format(marker="square"))
     _import_fresh("test_change_frozentup_helpers")
@@ -1276,15 +1292,23 @@ def test_enum_value_from_global_change_causes_miss(module_dir: pathlib.Path) -> 
 
     mod = _import_fresh("test_change_enumglobal_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "enum:CAPTURED.value" in fp1, "Enum member value should be tracked"
+    assert "enum:test_change_enumglobal_stage.CAPTURED.value" in fp1, (
+        "Enum member value should be tracked"
+    )
 
     helpers_py.write_text(template.format(value="second"))
     _import_fresh("test_change_enumglobal_helpers")
     mod = _import_fresh("test_change_enumglobal_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["enum:CAPTURED"] == fp2["enum:CAPTURED"], "Member identity is unchanged"
-    assert fp1["enum:CAPTURED.value"] != fp2["enum:CAPTURED.value"], "Value hash must change"
+    assert (
+        fp1["enum:test_change_enumglobal_stage.CAPTURED"]
+        == fp2["enum:test_change_enumglobal_stage.CAPTURED"]
+    ), "Member identity is unchanged"
+    assert (
+        fp1["enum:test_change_enumglobal_stage.CAPTURED.value"]
+        != fp2["enum:test_change_enumglobal_stage.CAPTURED.value"]
+    ), "Value hash must change"
     assert fp1 != fp2, "Indirect enum value change must cause miss"
 
 
@@ -1303,7 +1327,9 @@ def test_enum_mutable_value_change_causes_miss(module_dir: pathlib.Path) -> None
 
     mod = _import_fresh("test_change_enummut_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "enum:CAPTURED.value" in fp1, "Mutable enum value should be content-hashed"
+    assert "enum:test_change_enummut_stage.CAPTURED.value" in fp1, (
+        "Mutable enum value should be content-hashed"
+    )
 
     helpers_py.write_text(template.format(value="[1, 2, 3]"))
     _import_fresh("test_change_enummut_helpers")
@@ -1335,7 +1361,10 @@ def test_intflag_pseudo_member_value_change_causes_miss(module_dir: pathlib.Path
     mod = _import_fresh("test_change_intflag_stage")
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
-    assert fp1["enum:DEFAULT"] == fp2["enum:DEFAULT"], "Both pseudo-members have name=None"
+    assert (
+        fp1["enum:test_change_intflag_stage.DEFAULT"]
+        == fp2["enum:test_change_intflag_stage.DEFAULT"]
+    ), "Both pseudo-members have name=None"
     assert fp1 != fp2, "IntFlag pseudo-member value change must cause miss"
 
 
@@ -1352,7 +1381,9 @@ def test_functional_enum_value_change_causes_miss(module_dir: pathlib.Path) -> N
 
     mod = _import_fresh("test_change_funcenum_stage")
     fp1 = fingerprint.get_stage_fingerprint(mod.stage)
-    assert "enum:CAPTURED.value" in fp1, "Functional enum member value should be tracked"
+    assert "enum:test_change_funcenum_stage.CAPTURED.value" in fp1, (
+        "Functional enum member value should be tracked"
+    )
 
     helpers_py.write_text(template.format(members="{'A': 'second'}"))
     _import_fresh("test_change_funcenum_helpers")
@@ -1385,7 +1416,9 @@ def test_cached_property_transitive_dependency_change_causes_miss(module_dir: pa
     assert any(k.startswith("method:") and k.endswith(".Cfg.computed") for k in fp1), (
         "cached_property should be fingerprinted"
     )
-    assert "func:dep" in fp1, "cached_property's transitive dependency should be followed"
+    assert "func:test_change_cachedprop_helpers.dep" in fp1, (
+        "cached_property's transitive dependency should be followed"
+    )
 
     helpers_py.write_text(template.format(n=999))
     _import_fresh("test_change_cachedprop_helpers")
@@ -1419,7 +1452,9 @@ def test_property_setter_transitive_dependency_change_causes_miss(module_dir: pa
     assert any(k.startswith("method:") and k.endswith(".Cfg.value.setter") for k in fp1), (
         "Property setter should be fingerprinted"
     )
-    assert "func:validate" in fp1, "Setter's transitive dependency should be followed"
+    assert "func:test_change_setter_helpers.validate" in fp1, (
+        "Setter's transitive dependency should be followed"
+    )
 
     helpers_py.write_text(template.format(n=999))
     _import_fresh("test_change_setter_helpers")
@@ -1450,7 +1485,9 @@ def test_dunder_call_transitive_dependency_change_causes_miss(module_dir: pathli
     assert any(k.startswith("method:") and k.endswith(".Adder.__call__") for k in fp1), (
         "User-authored __call__ should be fingerprinted"
     )
-    assert "func:dep" in fp1, "__call__'s transitive dependency should be followed"
+    assert "func:test_change_dunder_helpers.dep" in fp1, (
+        "__call__'s transitive dependency should be followed"
+    )
 
     helpers_py.write_text(template.format(n=999))
     _import_fresh("test_change_dunder_helpers")
@@ -1458,3 +1495,80 @@ def test_dunder_call_transitive_dependency_change_causes_miss(module_dir: pathli
     fp2 = fingerprint.get_stage_fingerprint(mod.stage)
 
     assert fp1 != fp2, "Behavioral dunder transitive dependency change must cause miss"
+
+
+# =============================================================================
+# SECTION: Same name in two modules (manifest keys are module-qualified)
+# =============================================================================
+
+
+def test_same_named_constants_in_two_modules_both_recorded(module_dir: pathlib.Path) -> None:
+    """Two modules defining the same constant name contribute separate manifest entries."""
+    (module_dir / "test_change_collide_a.py").write_text(
+        "MARGIN = 0.26\n\ndef width():\n    return 1 - MARGIN\n"
+    )
+    (module_dir / "test_change_collide_b.py").write_text(
+        "MARGIN = 0.75\n\ndef height():\n    return 1 - MARGIN\n"
+    )
+    (module_dir / "test_change_collide_stage.py").write_text(
+        "from test_change_collide_a import width\n"
+        + "from test_change_collide_b import height\n\n"
+        + "def stage():\n    return width() + height()\n"
+    )
+
+    mod = _import_fresh("test_change_collide_stage")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp["const:test_change_collide_a.MARGIN"] == "0.26"
+    assert fp["const:test_change_collide_b.MARGIN"] == "0.75"
+
+
+def test_same_named_helper_change_in_either_module_detected(module_dir: pathlib.Path) -> None:
+    """Same-named helpers in two modules are tracked separately, so either edit is seen."""
+    helper_a = module_dir / "test_change_dup_a.py"
+    helper_b = module_dir / "test_change_dup_b.py"
+    helper_a.write_text("def render(x):\n    return x + 1\n")
+    helper_b.write_text("def render(x):\n    return x * 2\n")
+    (module_dir / "test_change_dup_stage.py").write_text(
+        "import test_change_dup_a\nimport test_change_dup_b\n\n"
+        + "def stage(x):\n    return test_change_dup_a.render(x) + test_change_dup_b.render(x)\n"
+    )
+
+    mod = _import_fresh("test_change_dup_stage")
+    fp1 = fingerprint.get_stage_fingerprint(mod.stage)
+    assert "mod:test_change_dup_a.render" in fp1
+    assert "mod:test_change_dup_b.render" in fp1
+
+    helper_b.write_text("def render(x):\n    return x * 3\n")
+    _import_fresh("test_change_dup_b")
+    mod = _import_fresh("test_change_dup_stage")
+    fp2 = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert fp1["mod:test_change_dup_a.render"] == fp2["mod:test_change_dup_a.render"]
+    assert fp1["mod:test_change_dup_b.render"] != fp2["mod:test_change_dup_b.render"], (
+        "A same-named helper in another module must not mask this one's change"
+    )
+
+
+def test_same_named_pydantic_models_in_two_modules_both_recorded(
+    module_dir: pathlib.Path,
+) -> None:
+    """Two modules defining a model class of the same name get one schema entry each."""
+    (module_dir / "test_change_model_a.py").write_text(
+        "import pydantic\n\nclass Params(pydantic.BaseModel):\n    a: int = 1\n"
+    )
+    (module_dir / "test_change_model_b.py").write_text(
+        "import pydantic\n\nclass Params(pydantic.BaseModel):\n    b: str = 'x'\n"
+    )
+    (module_dir / "test_change_model_stage.py").write_text(
+        "from test_change_model_a import Params as ParamsA\n"
+        + "from test_change_model_b import Params as ParamsB\n\n"
+        + "def stage(a: ParamsA, b: ParamsB) -> None:\n    return None\n"
+    )
+
+    mod = _import_fresh("test_change_model_stage")
+    fp = fingerprint.get_stage_fingerprint(mod.stage)
+
+    assert "schema:test_change_model_a.Params" in fp
+    assert "schema:test_change_model_b.Params" in fp
+    assert fp["schema:test_change_model_a.Params"] != fp["schema:test_change_model_b.Params"]

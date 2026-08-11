@@ -60,7 +60,7 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured with a hash (not "callable")
-    helper_key = "mod:helpers.process"
+    helper_key = "mod:test_mod_helpers_v1.process"
     assert helper_key in fp1, f"Should capture helper.process, got: {fp1.keys()}"
     hash1 = fp1[helper_key]
     assert len(hash1) == 16, f"Should be 16-char hash, got: {hash1}"
@@ -138,7 +138,9 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify transitive dep is captured
-    assert "mod:leaf.leaf_func" in fp1, f"Should capture transitive dep, got: {fp1.keys()}"
+    assert "mod:test_mod_leaf_v3.leaf_func" in fp1, (
+        f"Should capture transitive dep, got: {fp1.keys()}"
+    )
 
     # Modify leaf function
     leaf_py.write_text("""
@@ -154,7 +156,7 @@ def leaf_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Transitive fingerprint must change
-    assert fp1["mod:leaf.leaf_func"] != fp2["mod:leaf.leaf_func"], (
+    assert fp1["mod:test_mod_leaf_v3.leaf_func"] != fp2["mod:test_mod_leaf_v3.leaf_func"], (
         "Transitive dep fingerprint must change"
     )
 
@@ -200,8 +202,10 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Verify helper is captured
-    assert "func:helper_func" in fp1, f"Should capture helper_func, got: {fp1.keys()}"
-    hash1 = fp1["func:helper_func"]
+    assert "func:test_mod_helpers_v5.helper_func" in fp1, (
+        f"Should capture helper_func, got: {fp1.keys()}"
+    )
+    hash1 = fp1["func:test_mod_helpers_v5.helper_func"]
 
     # Modify helper
     helpers_py.write_text("""
@@ -215,7 +219,7 @@ def helper_func(x):
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
 
     # Fingerprint must change
-    hash2 = fp2["func:helper_func"]
+    hash2 = fp2["func:test_mod_helpers_v5.helper_func"]
     assert hash1 != hash2, f"Direct import fingerprint must change: {hash1} vs {hash2}"
 
 
@@ -241,8 +245,8 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Constant should be captured with repr value
-    assert "mod:helpers.THRESHOLD" in fp, f"Should capture constant, got: {fp.keys()}"
-    assert fp["mod:helpers.THRESHOLD"] == "0.5", (
+    assert "mod:test_mod_helpers_v6.THRESHOLD" in fp, f"Should capture constant, got: {fp.keys()}"
+    assert fp["mod:test_mod_helpers_v6.THRESHOLD"] == "0.5", (
         f"Constant value should be repr, got: {fp['mod:helpers.THRESHOLD']}"
     )
 
@@ -271,12 +275,12 @@ def run_stage():
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     # Both should be captured
-    assert "func:func_a" in fp, "Should capture direct import"
-    assert "mod:helpers.func_b" in fp, "Should capture module attr"
+    assert "func:test_mod_helpers_v7.func_a" in fp, "Should capture direct import"
+    assert "mod:test_mod_helpers_v7.func_b" in fp, "Should capture module attr"
 
     # Both should be hashes (not "callable")
-    assert len(fp["func:func_a"]) == 16, "Direct import should be hashed"
-    assert len(fp["mod:helpers.func_b"]) == 16, "Module attr should be hashed"
+    assert len(fp["func:test_mod_helpers_v7.func_a"]) == 16, "Direct import should be hashed"
+    assert len(fp["mod:test_mod_helpers_v7.func_b"]) == 16, "Module attr should be hashed"
 
 
 def test_mutable_module_collection_raises_error(
@@ -306,7 +310,9 @@ def run_stage():
         with pytest.raises(exceptions.StageDefinitionError) as exc:
             fingerprint.get_stage_fingerprint(stage_mod.run_stage)
         message = str(exc.value)
-        assert "helpers.MY_COLL" in message, "Should name the module attribute"
+        assert f"test_mod_helpers_mut_{suffix}.MY_COLL" in message, (
+            "Should name the module attribute"
+        )
         assert f"type: {suffix}" in message, "Should include the captured type"
 
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
@@ -346,7 +352,11 @@ def run_stage():
     stage_mod = _import_module("test_mod_stage_v9")
     manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
-    for key in ["mod:helpers.AGENTS", "mod:helpers.NUMBERS", "mod:helpers.NESTED"]:
+    for key in [
+        "mod:test_mod_helpers_v9.AGENTS",
+        "mod:test_mod_helpers_v9.NUMBERS",
+        "mod:test_mod_helpers_v9.NESTED",
+    ]:
         assert key in manifest
         assert len(manifest[key]) == 16  # xxhash64 hex digest length
 
@@ -368,7 +378,7 @@ def run_stage():
 
     stage_mod = _import_module("test_mod_stage_v10")
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-    hash1 = fp1["mod:helpers.AGENTS"]
+    hash1 = fp1["mod:test_mod_helpers_v10.AGENTS"]
 
     helpers_py.write_text("""
 AGENTS = (("agent1", "config1"), ("agent3", "config3"))  # CHANGED!
@@ -377,7 +387,7 @@ AGENTS = (("agent1", "config1"), ("agent3", "config3"))  # CHANGED!
     _reimport_module("test_mod_helpers_v10")
     stage_mod_v2 = _reimport_module("test_mod_stage_v10")
     fp2 = fingerprint.get_stage_fingerprint(stage_mod_v2.run_stage)
-    hash2 = fp2["mod:helpers.AGENTS"]
+    hash2 = fp2["mod:test_mod_helpers_v10.AGENTS"]
 
     assert hash1 != hash2, f"Fingerprint must change when collection changes: {hash1} vs {hash2}"
 
@@ -403,9 +413,14 @@ def run_stage():
     fp1 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
     fp2 = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
-    assert fp1["mod:helpers.TUPLE_DATA"] == fp2["mod:helpers.TUPLE_DATA"]
-    assert fp1["mod:helpers.FROZENSET_DATA"] == fp2["mod:helpers.FROZENSET_DATA"]
-    assert fp1["mod:helpers.NESTED_DATA"] == fp2["mod:helpers.NESTED_DATA"]
+    assert fp1["mod:test_mod_helpers_v11.TUPLE_DATA"] == fp2["mod:test_mod_helpers_v11.TUPLE_DATA"]
+    assert (
+        fp1["mod:test_mod_helpers_v11.FROZENSET_DATA"]
+        == fp2["mod:test_mod_helpers_v11.FROZENSET_DATA"]
+    )
+    assert (
+        fp1["mod:test_mod_helpers_v11.NESTED_DATA"] == fp2["mod:test_mod_helpers_v11.NESTED_DATA"]
+    )
 
 
 def test_immutable_module_collection_edge_cases(module_dir: pathlib.Path) -> None:
@@ -435,10 +450,10 @@ def run_stage():
     manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
     for key in [
-        "mod:helpers.EMPTY_TUPLE",
-        "mod:helpers.EMPTY_FROZENSET",
-        "mod:helpers.DEEPLY_NESTED",
-        "mod:helpers.LARGE_TUPLE",
+        "mod:test_mod_helpers_v12.EMPTY_TUPLE",
+        "mod:test_mod_helpers_v12.EMPTY_FROZENSET",
+        "mod:test_mod_helpers_v12.DEEPLY_NESTED",
+        "mod:test_mod_helpers_v12.LARGE_TUPLE",
     ]:
         assert key in manifest
         assert len(manifest[key]) == 16
@@ -463,7 +478,10 @@ def run_stage():
     stage_mod = _import_module("test_mod_stage_v13")
     manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
-    for key in ["mod:helpers.TUPLE_ALL_TYPES", "mod:helpers.FROZENSET_PRIMITIVES"]:
+    for key in [
+        "mod:test_mod_helpers_v13.TUPLE_ALL_TYPES",
+        "mod:test_mod_helpers_v13.FROZENSET_PRIMITIVES",
+    ]:
         assert key in manifest
         assert len(manifest[key]) == 16
 
@@ -527,7 +545,7 @@ def run_stage():
 """)
     stage_mod = _import_module("test_mod_stage_call_tuple")
     manifest = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
-    assert any(k.startswith("func:helpers.HANDLERS[") for k in manifest), (
+    assert any(k.startswith("func:test_mod_helpers_call_tuple.") for k in manifest), (
         "Callables inside the module-attr tuple should be tracked"
     )
 

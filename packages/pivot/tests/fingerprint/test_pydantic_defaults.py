@@ -84,10 +84,10 @@ def test_string_constants_are_captured():
     fp = fingerprint.get_stage_fingerprint(_stage_references_string)
 
     # Strings, ints, floats, bytes, bool, None ARE captured
-    assert "const:STRING_CONST" in fp, (
+    assert "const:test_pydantic_defaults.STRING_CONST" in fp, (
         f"String constants should be captured. Got keys: {list(fp.keys())}"
     )
-    assert fp["const:STRING_CONST"] == "'hello'"
+    assert fp["const:test_pydantic_defaults.STRING_CONST"] == "'hello'"
 
 
 def test_pydantic_class_captured_from_type_hint():
@@ -95,7 +95,7 @@ def test_pydantic_class_captured_from_type_hint():
     fp = fingerprint.get_stage_fingerprint(_stage_with_pydantic_param_v1)
 
     # Type hints with Pydantic models are tracked
-    assert "class:ParamsWithListDefault" in fp, (
+    assert "class:test_pydantic_defaults.ParamsWithListDefault" in fp, (
         f"Pydantic class should be captured. Got keys: {list(fp.keys())}"
     )
 
@@ -106,14 +106,14 @@ def test_pydantic_default_data_captured():
     fp2 = fingerprint.get_stage_fingerprint(_stage_with_config_list)
 
     # Pydantic schema hashes ARE captured
-    assert "schema:ParamsWithListDefault" in fp1, (
+    assert "schema:test_pydantic_defaults.ParamsWithListDefault" in fp1, (
         f"Pydantic schema should be captured. Got keys: {list(fp1.keys())}"
     )
-    assert "schema:ParamsWithConfigList" in fp2, (
+    assert "schema:test_pydantic_defaults.ParamsWithConfigList" in fp2, (
         f"Pydantic schema should be captured. Got keys: {list(fp2.keys())}"
     )
-    assert "schema:ItemConfig" in fp2
-    assert "class:ItemConfig" in fp2
+    assert "schema:test_pydantic_defaults.ItemConfig" in fp2
+    assert "class:test_pydantic_defaults.ItemConfig" in fp2
 
 
 def test_pydantic_default_change_triggers_different_hash():
@@ -136,9 +136,14 @@ def test_pydantic_default_change_triggers_different_hash():
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
     # The schema hashes should be different
-    assert fp1["schema:ParamsV1"] != fp2["schema:ParamsV2"], (
-        "Different default values should produce different hashes"
-    )
+    assert (
+        fp1[
+            "schema:test_pydantic_defaults.test_pydantic_default_change_triggers_different_hash.<locals>.ParamsV1"
+        ]
+        != fp2[
+            "schema:test_pydantic_defaults.test_pydantic_default_change_triggers_different_hash.<locals>.ParamsV2"
+        ]
+    ), "Different default values should produce different hashes"
 
 
 def test_pydantic_nested_model_defaults_captured():
@@ -146,11 +151,11 @@ def test_pydantic_nested_model_defaults_captured():
     fp = fingerprint.get_stage_fingerprint(_stage_with_config_list)
 
     # The nested model schema should be hashed
-    assert "schema:ParamsWithConfigList" in fp
-    assert "schema:ItemConfig" in fp
+    assert "schema:test_pydantic_defaults.ParamsWithConfigList" in fp
+    assert "schema:test_pydantic_defaults.ItemConfig" in fp
 
     # Verify it's a real hash (16 hex chars)
-    hash_val = fp["schema:ParamsWithConfigList"]
+    hash_val = fp["schema:test_pydantic_defaults.ParamsWithConfigList"]
     assert len(hash_val) == 16, f"Expected 16-char hash, got {hash_val}"
     assert all(c in "0123456789abcdef" for c in hash_val)
 
@@ -161,8 +166,8 @@ def test_fingerprint_includes_class_and_defaults():
 
     # Should have: self:, class:, schema:
     assert "self:_stage_with_pydantic_param_v1" in fp
-    assert "class:ParamsWithListDefault" in fp
-    assert "schema:ParamsWithListDefault" in fp
+    assert "class:test_pydantic_defaults.ParamsWithListDefault" in fp
+    assert "schema:test_pydantic_defaults.ParamsWithListDefault" in fp
     assert len(fp) == 3, f"Expected 3 entries, got {len(fp)}: {list(fp.keys())}"
 
 
@@ -178,9 +183,10 @@ def test_default_factory_is_tracked():
     fp = fingerprint.get_stage_fingerprint(stage)
 
     # default_factory should be captured
-    assert "schema:ParamsWithFactory" in fp, (
-        f"default_factory should be captured. Got keys: {list(fp.keys())}"
-    )
+    assert (
+        "schema:test_pydantic_defaults.test_default_factory_is_tracked.<locals>.ParamsWithFactory"
+        in fp
+    ), f"default_factory should be captured. Got keys: {list(fp.keys())}"
 
 
 def test_default_factory_change_triggers_different_hash():
@@ -202,9 +208,14 @@ def test_default_factory_change_triggers_different_hash():
     fp2 = fingerprint.get_stage_fingerprint(stage_v2)
 
     # Different factories should produce different hashes
-    assert fp1["schema:ParamsV1"] != fp2["schema:ParamsV2"], (
-        "Different default_factory functions should produce different hashes"
-    )
+    assert (
+        fp1[
+            "schema:test_pydantic_defaults.test_default_factory_change_triggers_different_hash.<locals>.ParamsV1"
+        ]
+        != fp2[
+            "schema:test_pydantic_defaults.test_default_factory_change_triggers_different_hash.<locals>.ParamsV2"
+        ]
+    ), "Different default_factory functions should produce different hashes"
 
 
 def test_none_default_is_tracked():
@@ -219,9 +230,9 @@ def test_none_default_is_tracked():
     fp = fingerprint.get_stage_fingerprint(stage)
 
     # None default should be captured
-    assert "schema:ParamsWithNone" in fp, (
-        f"None default should be captured. Got keys: {list(fp.keys())}"
-    )
+    assert (
+        "schema:test_pydantic_defaults.test_none_default_is_tracked.<locals>.ParamsWithNone" in fp
+    ), f"None default should be captured. Got keys: {list(fp.keys())}"
 
 
 def test_frozenset_default_is_deterministic():
