@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
 from helpers import register_test_stage
@@ -70,6 +71,39 @@ def _helper_stage_b(
     _ = a_file
     pathlib.Path("b.txt").write_text("output b")
     return _BTxtOutputs(output=pathlib.Path("b.txt"))
+
+
+class _ProducedOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("produced.txt", loaders.PathOnly())]
+
+
+class _ConsumedOutputs(TypedDict):
+    output: Annotated[pathlib.Path, outputs.Out("consumed.txt", loaders.PathOnly())]
+
+
+def _helper_producer(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _ProducedOutputs:
+    pathlib.Path("produced.txt").write_text(input_file.read_text())
+    return _ProducedOutputs(output=pathlib.Path("produced.txt"))
+
+
+def _helper_consumer(
+    produced: Annotated[pathlib.Path, outputs.Dep("produced.txt", loaders.PathOnly())],
+) -> _ConsumedOutputs:
+    _ = produced
+    pathlib.Path("consumed.txt").write_text("done")
+    return _ConsumedOutputs(output=pathlib.Path("consumed.txt"))
+
+
+class _DirProducerOutputs(TypedDict):
+    files: Annotated[dict[str, str], outputs.DirectoryOut("data/", loaders.Text())]
+
+
+def _helper_dir_producer(
+    input_file: Annotated[pathlib.Path, outputs.Dep("input.txt", loaders.PathOnly())],
+) -> _DirProducerOutputs:
+    return _DirProducerOutputs(files={"file.csv": input_file.read_text()})
 
 
 class _DirDepOutputs(TypedDict):
@@ -736,8 +770,6 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     track.write_pvt_file(tmp_path / "data.pvt", pvt_data)
 
     # Delete the actual data directory (simulating CI without data)
-    import shutil
-
     shutil.rmtree(data_dir)
 
     _setup_mock_remote(mocker, files_exist_on_remote=True)
@@ -747,6 +779,93 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     # Should use manifest entry hash for data/file.csv
     assert "Missing deps" not in result.output, f"Got: {result.output}"
     assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+
+
+# =============================================================================
+# Producer Hash Fallback Tests
+# =============================================================================
+
+
+def _register_producer_consumer() -> None:
+    register_test_stage(_helper_producer, name="producer")
+    register_test_stage(_helper_consumer, name="consumer")
+
+
+def test_verify_allow_missing_detects_stale_consumer_of_rerun_producer(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """verify --allow-missing fails when only the producer was re-run.
+
+    The consumer's lock file still records the producer's old output hash. With the
+    artifact absent locally, checking the consumer against its own lock file would
+    compare that stale hash to itself and pass.
+    """
+    (tmp_path / "input.txt").write_text("v1")
+    _register_producer_consumer()
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+
+    # Re-run the producer alone, so its output moves but the consumer is not updated.
+    (tmp_path / "input.txt").write_text("v2")
+    assert runner.invoke(cli.cli, ["run", "producer"]).exit_code == 0
+
+    (tmp_path / "produced.txt").unlink()
+
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code == 1, f"Expected failure, got: {result.output}"
+    assert "✗ consumer: failed" in result.output
+    assert "Input dependencies changed" in result.output
+
+
+def test_verify_allow_missing_passes_when_producer_hash_matches(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """verify --allow-missing passes for an up-to-date chain with the artifact absent."""
+    (tmp_path / "input.txt").write_text("v1")
+    _register_producer_consumer()
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+
+    (tmp_path / "produced.txt").unlink()
+
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code == 0, f"Expected pass, got: {result.output}"
+
+
+def test_verify_allow_missing_detects_stale_nested_dep(
+    mock_discovery: Pipeline,
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+) -> None:
+    """A dep inside a producer's directory output is checked against its manifest."""
+    (tmp_path / "input.txt").write_text("v1")
+    register_test_stage(_helper_dir_producer, name="producer")
+    register_test_stage(_helper_dir_dep_stage, name="consumer")
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+
+    (tmp_path / "input.txt").write_text("v2")
+    assert runner.invoke(cli.cli, ["run", "producer"]).exit_code == 0
+
+    shutil.rmtree(tmp_path / "data")
+
+    _setup_mock_remote(mocker, files_exist_on_remote=True)
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code == 1, f"Expected failure, got: {result.output}"
+    assert "✗ consumer: failed" in result.output
+    assert "Input dependencies changed" in result.output
 
 
 # =============================================================================

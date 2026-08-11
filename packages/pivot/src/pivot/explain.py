@@ -100,16 +100,23 @@ def get_stage_explanation(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    producer_hashes: dict[str, HashInfo] | None = None,
     state_db: state.StateDB | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
     Args:
-        allow_missing: If True and a dep file is missing, try to use hash from
-            tracked_files (.pvt data) first, then fall back to the lock file's
-            recorded hash for that dep (enabling remote verification).
+        allow_missing: If True and a dep file is missing, substitute a hash for it
+            instead of reporting it missing: the producing stage's recorded output
+            hash, else the .pvt hash, else this stage's own recorded dep hash
+            (enabling remote verification).
         tracked_files: Dict of absolute path -> PvtData from .pvt files.
         tracked_trie: Trie of tracked paths for efficient lookup.
+        producer_hashes: Dict of absolute dep path -> the hash the producing stage
+            recorded for that artifact. Falling back to this stage's own dep hash
+            compares the lock file against itself, so an upstream stage that was
+            re-run without re-running this one goes undetected whenever the
+            artifact is absent locally.
         state_db: A pre-opened readonly StateDB to reuse. When explaining many
             stages concurrently, the caller must open one shared env and pass it
             here: LMDB forbids opening the same env twice in a process, and racing
@@ -191,12 +198,16 @@ def get_stage_explanation(
                 if dep_path.exists():
                     deps_to_hash.append(dep)
                 else:
-                    # Try .pvt file first
-                    hash_info = None
-                    if tracked_files is not None and tracked_trie is not None:
+                    normalized = str(project.normalize_path(dep))
+                    # Prefer the producing stage's recorded output hash: it is the
+                    # only substitute that can still disagree with what this stage
+                    # recorded, and so the only one that detects a stale upstream.
+                    hash_info = (
+                        producer_hashes.get(normalized) if producer_hashes is not None else None
+                    )
+                    if hash_info is None and tracked_files is not None and tracked_trie is not None:
                         hash_info = _find_tracked_hash(dep_path, tracked_files, tracked_trie)
                     # Fall back to lock file hash (for remote verification)
-                    normalized = str(project.normalize_path(dep))
                     if hash_info is None:
                         hash_info = lock_data["dep_hashes"].get(normalized)
                     if hash_info:
