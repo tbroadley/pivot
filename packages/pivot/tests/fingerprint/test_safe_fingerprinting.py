@@ -198,7 +198,7 @@ def test_immutable_closure_capture_allows_fingerprint(func: Callable[[], object]
 
 def test_enum_member_capture_is_tracked() -> None:
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_member)
-    assert manifest["enum:ENUM_MEMBER"] == "Basis.FRONTIER", (
+    assert manifest["enum:test_safe_fingerprinting.ENUM_MEMBER"] == "Basis.FRONTIER", (
         "Captured enum member should be tracked by class-qualified name"
     )
 
@@ -206,10 +206,10 @@ def test_enum_member_capture_is_tracked() -> None:
 def test_callable_enum_member_capture_is_tracked() -> None:
     """An enum member is tracked via the enum path even when the enum defines __call__."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_enum_member)
-    assert manifest["enum:CALLABLE_ENUM_MEMBER"] == "CallableBasis.A", (
+    assert manifest["enum:test_safe_fingerprinting.CALLABLE_ENUM_MEMBER"] == "CallableBasis.A", (
         "Callable enum member must be tracked by name, not id()-hashed as a callable"
     )
-    assert "func:CALLABLE_ENUM_MEMBER" not in manifest, (
+    assert f"func:{__name__}.CALLABLE_ENUM_MEMBER" not in manifest, (
         "Callable enum member must not fall through to the callable branch"
     )
 
@@ -312,7 +312,7 @@ def test_instance_in_tuple_raises() -> None:
 def test_callable_tuple_allows_fingerprint() -> None:
     """A tuple of callables (dispatch table) is still allowed; the callables are tracked."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_callable_tuple)
-    assert any(k.startswith("func:CALLABLE_TUPLE[") for k in manifest), (
+    assert f"func:{__name__}._callable_helper" in manifest, (
         "Callables inside the tuple should be tracked"
     )
 
@@ -320,35 +320,43 @@ def test_callable_tuple_allows_fingerprint() -> None:
 def test_enum_tuple_allows_fingerprint_and_tracks_members() -> None:
     """A tuple of enum members is allowed (like a standalone enum) and each member is tracked."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_tuple)
-    assert "const:ENUM_TUPLE" in manifest, "The tuple itself should be content-hashed"
-    assert manifest["enum:ENUM_TUPLE[0]"] == "Basis.FRONTIER"
-    assert manifest["enum:ENUM_TUPLE[1]"] == "Basis.HEAD"
+    assert "const:test_safe_fingerprinting.ENUM_TUPLE" in manifest, (
+        "The tuple itself should be content-hashed"
+    )
+    assert manifest["enum:test_safe_fingerprinting.ENUM_TUPLE[0]"] == "Basis.FRONTIER"
+    assert manifest["enum:test_safe_fingerprinting.ENUM_TUPLE[1]"] == "Basis.HEAD"
 
 
 def test_enum_frozenset_allows_fingerprint_and_tracks_members() -> None:
     """A frozenset of enum members is allowed and its members are tracked by name."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_enum_frozenset)
-    assert "const:ENUM_FROZENSET" in manifest, "The frozenset itself should be content-hashed"
-    assert manifest["enum:ENUM_FROZENSET[0]"] == "Basis.FRONTIER"
+    assert "const:test_safe_fingerprinting.ENUM_FROZENSET" in manifest, (
+        "The frozenset itself should be content-hashed"
+    )
+    assert manifest["enum:test_safe_fingerprinting.ENUM_FROZENSET[0]"] == "Basis.FRONTIER"
 
 
 def test_frozen_dataclass_tuple_allows_fingerprint_and_tracks_class() -> None:
     """A tuple of frozen dataclass instances is allowed, content-hashed, and its class tracked."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_dataclass_tuple)
-    assert "const:FROZEN_DATACLASS_TUPLE" in manifest, "The tuple should be content-hashed"
-    assert "class:FROZEN_DATACLASS_TUPLE[0].__class__" in manifest, (
-        "Element class should be tracked"
+    assert "const:test_safe_fingerprinting.FROZEN_DATACLASS_TUPLE" in manifest, (
+        "The tuple should be content-hashed"
     )
+    assert f"class:{__name__}.FrozenConfig" in manifest, "Element class should be tracked"
 
 
 def test_frozen_pydantic_tuple_allows_fingerprint_and_tracks_class() -> None:
     """A tuple of frozen pydantic instances is allowed, content-hashed, and its class tracked."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_frozen_pydantic_tuple)
-    assert "const:FROZEN_PYDANTIC_TUPLE" in manifest, "The tuple should be content-hashed"
-    assert "class:FROZEN_PYDANTIC_TUPLE[0].__class__" in manifest, "Element class should be tracked"
+    assert "const:test_safe_fingerprinting.FROZEN_PYDANTIC_TUPLE" in manifest, (
+        "The tuple should be content-hashed"
+    )
+    assert f"class:{__name__}.FrozenModel" in manifest, "Element class should be tracked"
 
 
 def test_nested_frozen_instance_tuple_allows_fingerprint() -> None:
     """A tuple of (label, frozen-instance) tuples is allowed and content-hashed."""
     manifest = fingerprint.get_stage_fingerprint(_stage_uses_nested_frozen_tuple)
-    assert "const:NESTED_FROZEN_TUPLE" in manifest, "The nested tuple should be content-hashed"
+    assert "const:test_safe_fingerprinting.NESTED_FROZEN_TUPLE" in manifest, (
+        "The nested tuple should be content-hashed"
+    )

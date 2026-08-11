@@ -219,14 +219,22 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | Prefix | Purpose | Example |
 |--------|---------|---------|
 | `self:` | The stage function itself | `self:` |
-| `func:` | Helper functions (user code callables) | `func:process_data` |
-| `class:` | Class definitions | `class:MyModel` |
-| `const:` | Global constants (primitives via `repr()`) | `const:THRESHOLD` |
-| `mod:` | Module attribute access patterns | `mod:utils.helper` |
-| `partial:` | `functools.partial` bound arguments | `partial:0`, `partial:kwarg_name` |
-| `loader:` | Loader class methods and config | `loader:load`, `loader:save`, `loader:config` |
-| `schema:` | Pydantic model JSON schema | `schema:ModelName` |
+| `func:` | Helper functions (user code callables) | `func:pkg.utils.process_data` |
+| `class:` | Class definitions | `class:pkg.models.MyModel` |
+| `const:` | Global constants (primitives via `repr()`) | `const:pkg.plots.THRESHOLD` |
+| `mod:` | Module attribute access patterns | `mod:pkg.utils.helper` |
+| `partial:` | `functools.partial` bound arguments | `partial:pkg.stages.bound.args` |
+| `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
+| `schema:` | Pydantic model JSON schema | `schema:pkg.params.ModelName` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
+
+Every key names the module it belongs to, because one manifest merges the transitive
+closure of many modules. A key derived from a definition (`func:`, `class:`, `mod:`,
+`schema:`, `loader:`) uses that object's `__module__`; a key for a value with no
+definition site of its own (`const:`, `partial:`, and lambdas) uses the module of the
+function that references it. Without this, a stage reaching two modules that each define
+`MARGIN` recorded one `const:MARGIN`, and which value survived depended on
+traversal order — which `PYTHONHASHSEED` can change from run to run.
 
 ## Comparison with Other Tools
 

@@ -101,7 +101,7 @@ class Model(pydantic.BaseModel):
 
 def stage(params: Model) -> None: pass
 
-print(fingerprint.get_stage_fingerprint(stage)["schema:Model"])
+print(fingerprint.get_stage_fingerprint(stage)["schema:__main__.Model"])
 """
     results = list[str]()
     for _ in range(2):
@@ -128,7 +128,7 @@ class Model(pydantic.BaseModel):
 
 def stage(params: Model) -> None: pass
 
-print(fingerprint.get_stage_fingerprint(stage)["schema:Model"])
+print(fingerprint.get_stage_fingerprint(stage)["schema:__main__.Model"])
 """
     results = list[str]()
     for _ in range(2):
@@ -178,7 +178,12 @@ def test_default_factory_list_produces_stable_hash():
     fp1 = fingerprint.get_stage_fingerprint(stage)
     fp2 = fingerprint.get_stage_fingerprint(stage)
 
-    assert fp1["schema:Model"] == fp2["schema:Model"]
+    assert (
+        fp1["schema:test_determinism.test_default_factory_list_produces_stable_hash.<locals>.Model"]
+        == fp2[
+            "schema:test_determinism.test_default_factory_list_produces_stable_hash.<locals>.Model"
+        ]
+    )
 
 
 def test_default_factory_dict_produces_stable_hash():
@@ -193,7 +198,12 @@ def test_default_factory_dict_produces_stable_hash():
     fp1 = fingerprint.get_stage_fingerprint(stage)
     fp2 = fingerprint.get_stage_fingerprint(stage)
 
-    assert fp1["schema:Model"] == fp2["schema:Model"]
+    assert (
+        fp1["schema:test_determinism.test_default_factory_dict_produces_stable_hash.<locals>.Model"]
+        == fp2[
+            "schema:test_determinism.test_default_factory_dict_produces_stable_hash.<locals>.Model"
+        ]
+    )
 
 
 def test_different_builtin_factories_have_different_hashes():
@@ -214,9 +224,14 @@ def test_different_builtin_factories_have_different_hashes():
     fp_list = fingerprint.get_stage_fingerprint(stage_list)
     fp_dict = fingerprint.get_stage_fingerprint(stage_dict)
 
-    assert fp_list["schema:ModelWithList"] != fp_dict["schema:ModelWithDict"], (
-        "Different builtin factories should produce different hashes"
-    )
+    assert (
+        fp_list[
+            "schema:test_determinism.test_different_builtin_factories_have_different_hashes.<locals>.ModelWithList"
+        ]
+        != fp_dict[
+            "schema:test_determinism.test_different_builtin_factories_have_different_hashes.<locals>.ModelWithDict"
+        ]
+    ), "Different builtin factories should produce different hashes"
 
 
 # --- Cross-process determinism for primitive collections ---
@@ -339,3 +354,49 @@ print(manifest["mod:constants.DEFAULT"], manifest["mod:constants.DEFAULT.value"]
         results.append(result.stdout.strip())
 
     assert len(set(results)) == 1, f"Functional enum capture hash varies across runs: {results}"
+
+
+@pytest.mark.slow
+def test_same_named_constants_deterministic_across_hash_seeds(tmp_path: pathlib.Path) -> None:
+    """A stage reaching two same-named constants hashes the same under any hash seed.
+
+    Regression: both landed on one bare `const:MARGIN` key, and which value survived
+    depended on set iteration order, which PYTHONHASHSEED randomizes.
+    """
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "left.py").write_text("MARGIN = 0.26\n\ndef width():\n    return 1 - MARGIN\n")
+    (tmp_path / "right.py").write_text("MARGIN = 0.75\n\ndef height():\n    return 1 - MARGIN\n")
+
+    script = f"""\
+import sys
+sys.path.insert(0, {str(tmp_path)!r})
+
+from left import width
+from right import height
+from pivot import fingerprint
+
+def stage():
+    inner = lambda: width() + height()
+    return inner()
+
+manifest = fingerprint.get_stage_fingerprint(stage)
+print(sorted((k, v) for k, v in manifest.items() if k.startswith("const:")))
+"""
+    results = list[str]()
+    for seed in ("0", "1", "12345"):
+        env = dict(os.environ)
+        env["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+            cwd=tmp_path,
+        )
+        results.append(result.stdout.strip())
+
+    assert len(set(results)) == 1, f"Constants vary with hash seed: {results}"
+    assert "0.26" in results[0] and "0.75" in results[0], (
+        f"Both modules' constants should be recorded: {results[0]}"
+    )

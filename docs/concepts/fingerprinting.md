@@ -13,12 +13,16 @@ logical keys to hashes:
 | Manifest key | What it represents |
 |--------------|--------------------|
 | `self:<name>` | The stage function's own AST |
-| `func:<name>` | Helper functions called by the stage |
-| `class:<name>` | User-defined classes referenced by the stage |
+| `func:<module>.<qualname>` | Helper functions called by the stage |
+| `class:<module>.<qualname>` | User-defined classes referenced by the stage |
 | `mod:<module>.<attr>` | Attributes accessed on imported user modules |
-| `const:<name>` | Global constants (primitives, frozen collections) |
-| `schema:<name>` | Pydantic model JSON schemas |
-| `loader:<class>:<method>` | Reader/Writer method ASTs and config |
+| `const:<module>.<name>` | Global constants (primitives, frozen collections) |
+| `schema:<module>.<qualname>` | Pydantic model JSON schemas |
+| `loader:<module>.<class>:<method>` | Reader/Writer method ASTs and config |
+
+One manifest holds the transitive closure of every module a stage reaches, so keys
+name a module and not just a symbol: two modules that both define `MARGIN` or
+`_helper` get an entry each, instead of one overwriting the other.
 
 ### How It Works
 

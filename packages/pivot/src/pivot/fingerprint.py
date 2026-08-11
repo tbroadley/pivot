@@ -32,8 +32,9 @@ _logger = logging.getLogger(__name__)
 
 _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Bump when the hashing scheme changes, to invalidate cached hashes computed by the
-# old scheme. Version 3: code-object hashes no longer include co_filename.
-_CACHE_SCHEMA_VERSION = 3
+# old scheme. Version 3: code-object hashes no longer include co_filename. Version 4:
+# manifest keys are qualified by module.
+_CACHE_SCHEMA_VERSION = 4
 _REPR_SIZE_LIMIT = 10_000
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
@@ -425,10 +426,14 @@ def get_stage_fingerprint(
 
     Returns dict with keys:
     - 'self:<name>': Function itself (hash)
-    - 'func:<name>': Referenced helper functions (hash, transitive)
-    - 'class:<name>': Referenced class definitions (hash, transitive)
+    - 'func:<module>.<qualname>': Referenced helper functions (hash, transitive)
+    - 'class:<module>.<qualname>': Referenced class definitions (hash, transitive)
     - 'mod:<module>.<attr>': User-code module attributes (hash for callables, repr for primitives)
-    - 'const:<name>': Global constants (repr value)
+    - 'const:<module>.<name>': Global constants (repr value)
+
+    Every key but 'self:' is qualified by a module, because one manifest merges the
+    transitive closure of many modules: two of them binding the same name to different
+    objects would otherwise overwrite each other's entry.
     """
     if visited is None:
         visited = set()
@@ -593,7 +598,9 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     if code_obj is not None and func_globals is not None:
         already_processed = set(closure_vars.globals.keys())
         nested_global_names = _collect_nested_code_globals(code_obj)
-        new_names = nested_global_names - already_processed
+        # Sorted: set iteration order depends on PYTHONHASHSEED, and processing order decides
+        # which of two same-named values wins a manifest key.
+        new_names = sorted(nested_global_names - already_processed)
         if new_names:
             nested_globals_dict = dict[str, Any]()
             for name in new_names:
@@ -647,7 +654,7 @@ def _process_class_body_dependencies(
             continue
         value = ns[name]
         if isinstance(value, type) and is_user_code(value):
-            key = f"class:{name}"
+            key = f"class:{_definition_ref(value)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, value, manifest, visited)
             if hasattr(value, "model_fields"):
@@ -659,7 +666,7 @@ def _process_class_body_dependencies(
         resolved = _resolve_dotted_path(parts, ns)
         if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
             continue
-        key = f"class:{parts[-1]}"
+        key = f"class:{_definition_ref(resolved)}"
         if key not in manifest:
             _add_callable_to_manifest(key, resolved, manifest, visited)
         if hasattr(resolved, "model_fields"):
@@ -830,14 +837,15 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     """Generate fingerprint manifest for a loader instance.
 
     Handles Reader, Writer, and Loader (which inherits from both) instances.
-    Only fingerprints methods that exist on the handler type:
-    - Reader: 'loader:<classname>:load' + empty() if overridden
-    - Writer: 'loader:<classname>:save'
+    Only fingerprints methods that exist on the handler type, keyed by the loader class's
+    '<module>.<qualname>':
+    - Reader: 'loader:<class>:load' + empty() if overridden
+    - Writer: 'loader:<class>:save'
     - Loader: All of the above
-    - Always: 'loader:<classname>:config' for dataclass field values
+    - Always: 'loader:<class>:config' for dataclass field values
     """
     manifest = dict[str, str]()
-    class_name = type(loader).__name__
+    class_name = _definition_ref(type(loader))
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
@@ -995,7 +1003,7 @@ def _is_frozen_pydantic(value: Any) -> bool:
 
 
 def _hash_unrecognized_closure_value(
-    name: str, value: Any, manifest: dict[str, str], stage_name: str
+    ref: str, name: str, value: Any, manifest: dict[str, str], stage_name: str
 ) -> None:
     try:
         value_repr = repr(value)
@@ -1008,7 +1016,7 @@ def _hash_unrecognized_closure_value(
     if len(value_repr) > _REPR_SIZE_LIMIT:
         _check_mutable_capture(name, value, stage_name)
         return
-    manifest[f"const:{name}"] = xxhash.xxh64(value_repr.encode()).hexdigest()
+    manifest[f"const:{ref}"] = xxhash.xxh64(value_repr.encode()).hexdigest()
 
 
 def _process_closure_values(
@@ -1026,20 +1034,22 @@ def _process_closure_values(
         if skip_dunders and name.startswith("__"):
             continue
 
+        ref = _binding_ref(func, name)
+
         # functools.partial fails is_user_code() (module is functools/stdlib)
         # Must check before general callable check
         if isinstance(value, functools.partial):
             _process_partial_dependency(
-                name, cast("functools.partial[Any]", value), manifest, visited
+                ref, cast("functools.partial[Any]", value), manifest, visited
             )
         elif isinstance(value, enum.Enum):
             # Enum members are immutable-by-convention, like the frozen dataclasses handled
             # below. This MUST come before the callable branches: an enum defining __call__
             # makes its members callable, which would otherwise route them to id()-based
             # fallback hashing.
-            _process_enum_dependency(f"enum:{name}", value, manifest, visited)
+            _process_enum_dependency(f"enum:{ref}", value, manifest, visited)
         elif callable(value) and is_user_code(value):
-            _process_callable_dependency(name, value, manifest, visited)
+            _process_callable_dependency(ref, value, manifest, visited)
         elif callable(value):
             # Non-user-code callables (stdlib/third-party functions like typing.cast,
             # json.dumps) are tracked via module dependency when accessed as module.func.
@@ -1051,7 +1061,7 @@ def _process_closure_values(
         elif isinstance(value, logging.Logger):
             continue
         elif isinstance(value, (bool, int, float, str, bytes, type(None))):
-            manifest[f"const:{name}"] = repr(value)
+            manifest[f"const:{ref}"] = repr(value)
         elif isinstance(value, (dict, list, tuple, set, frozenset)):
             if isinstance(value, (dict, list, set)):
                 _check_mutable_capture(name, value, stage_name)
@@ -1061,11 +1071,11 @@ def _process_closure_values(
                 # the pure-primitive ones (callables inside are tracked below regardless).
                 _check_immutable_collection_capture(name, value, stage_name)
                 if _is_primitive_collection(cast("object", value)):
-                    manifest[f"const:{name}"] = xxhash.xxh64(
+                    manifest[f"const:{ref}"] = xxhash.xxh64(
                         _serialize_value_for_hash(value).encode()
                     ).hexdigest()
             _process_collection_dependency(
-                name,
+                ref,
                 cast(
                     "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
                     value,
@@ -1075,25 +1085,25 @@ def _process_closure_values(
             )
         elif _is_user_class_instance(value):
             if _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
-                _process_instance_dependency(name, value, manifest, visited)
+                _process_instance_dependency(value, manifest, visited)
             else:
                 _check_mutable_capture(name, value, stage_name)
-                _process_instance_dependency(name, value, manifest, visited)
+                _process_instance_dependency(value, manifest, visited)
         else:
-            _hash_unrecognized_closure_value(name, value, manifest, stage_name)
+            _hash_unrecognized_closure_value(ref, name, value, manifest, stage_name)
 
 
 def _process_callable_dependency(
-    name: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
+    ref: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process a callable dependency and add to manifest."""
     # Use 'class:' prefix for type objects, 'func:' for functions
     prefix = "class" if isinstance(func, type) else "func"
-    _add_callable_to_manifest(f"{prefix}:{name}", func, manifest, visited)
+    _add_callable_to_manifest(f"{prefix}:{_callable_ref(func, ref)}", func, manifest, visited)
 
 
 def _process_partial_dependency(
-    name: str,
+    ref: str,
     partial_obj: functools.partial[Any],
     manifest: dict[str, str],
     visited: set[int],
@@ -1102,13 +1112,46 @@ def _process_partial_dependency(
     # Hash bound args and kwargs (changes to these should invalidate cache)
     args_str = _serialize_value_for_hash(partial_obj.args)
     kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
-    manifest[f"partial:{name}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
-    manifest[f"partial:{name}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
+    manifest[f"partial:{ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
+    manifest[f"partial:{ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
 
     # Recursively fingerprint the underlying function if it's user code
     underlying = partial_obj.func
     if callable(underlying) and is_user_code(underlying):
-        _add_callable_to_manifest(f"func:{name}.func", underlying, manifest, visited)
+        underlying_ref = _callable_ref(underlying, f"{ref}.func")
+        _add_callable_to_manifest(f"func:{underlying_ref}", underlying, manifest, visited)
+
+
+def _definition_ref(obj: Any) -> str:
+    """`<module>.<qualname>` for an object that carries its own definition site.
+
+    Manifest keys must name a definition, not a binding: two modules can bind the same name
+    (`MARGIN`, `_helper`) to different objects, and a manifest merges the transitive
+    closure of many modules into one flat dict.
+    """
+    module = getattr(obj, "__module__", None) or "<unknown>"
+    return f"{module}.{_get_qualname_for_cache(obj)}"
+
+
+def _callable_ref(func: Callable[..., Any], binding_ref: str) -> str:
+    """Definition site of a callable, falling back to how it was reached for lambdas.
+
+    A lambda has no name of its own, and disambiguating it by source position would make its
+    key move whenever a line is added above it.
+    """
+    if "<lambda>" in (getattr(func, "__qualname__", None) or ""):
+        return binding_ref
+    return _definition_ref(func)
+
+
+def _binding_ref(func: Callable[..., Any], name: str) -> str:
+    """`<module>.<name>` for a name `func` resolves in its own globals or closure.
+
+    Used for values with no definition site of their own — a constant's `0.26` cannot say
+    which module wrote it, so the referencing module qualifies the key instead.
+    """
+    module = getattr(func, "__module__", None) or "<unknown>"
+    return f"{module}.{name}"
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -1121,11 +1164,11 @@ def _is_user_class_instance(value: Any) -> bool:
 
 
 def _process_instance_dependency(
-    name: str, instance: Any, manifest: dict[str, str], visited: set[int]
+    instance: Any, manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Track the class definition of a user-defined instance."""
     cls = cast("type[Any]", type(instance))
-    _add_callable_to_manifest(f"class:{name}.__class__", cls, manifest, visited)
+    _add_callable_to_manifest(f"class:{_definition_ref(cls)}", cls, manifest, visited)
 
 
 def _encode_enum_member_value(cls: type, member: enum.Enum) -> str:
@@ -1172,7 +1215,7 @@ def _process_enum_dependency(
     manifest[key] = f"{cls.__qualname__}.{member.name}"
     manifest[f"{key}.value"] = _encode_enum_member_value(cls, member)
     if _enum_class_has_source(cls):
-        _add_callable_to_manifest(f"{key}.__class__", cls, manifest, visited)
+        _add_callable_to_manifest(f"class:{_definition_ref(cls)}", cls, manifest, visited)
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -1236,7 +1279,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
         if isinstance(origin, type) and is_user_code(origin):
             origin_type = cast("type[Any]", origin)
-            key = f"class:{origin_type.__name__}"
+            key = f"class:{_definition_ref(origin_type)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, origin_type, manifest, visited)
             if hasattr(origin_type, "model_fields"):
@@ -1255,7 +1298,7 @@ def _process_type_hint(hint: Any, manifest: dict[str, str], visited: set[int]) -
     if not is_user_code(hint_type):
         return
 
-    key = f"class:{hint_type.__name__}"
+    key = f"class:{_definition_ref(hint_type)}"
     if key not in manifest:
         _add_callable_to_manifest(key, hint_type, manifest, visited)
 
@@ -1309,7 +1352,7 @@ def _hash_pydantic_schema(
     visited: set[int],
 ) -> None:
     schema_model = model
-    schema_key = f"schema:{schema_model.__name__}"
+    schema_key = f"schema:{_definition_ref(schema_model)}"
     if schema_key in manifest:
         return
     # Insert placeholder to prevent infinite recursion on self-referential models
@@ -1349,7 +1392,7 @@ def _discover_pydantic_field_types(
         return
     if isinstance(annotation, type) and is_user_code(annotation):
         annotation_type = cast("type[Any]", annotation)
-        key = f"class:{annotation_type.__name__}"
+        key = f"class:{_definition_ref(annotation_type)}"
         if key not in manifest:
             _add_callable_to_manifest(key, annotation_type, manifest, visited)
         if hasattr(annotation_type, "model_fields"):
@@ -1440,9 +1483,9 @@ def _process_collection_element(
     elif _is_frozen_dataclass(value) or _is_frozen_pydantic(value):
         # Only frozen instances reach here — mutable ones are rejected upstream by
         # _check_immutable_collection_capture. Track the class like a standalone frozen capture.
-        _process_instance_dependency(ref, value, manifest, visited)
+        _process_instance_dependency(value, manifest, visited)
     elif callable(value) and is_user_code(value):
-        _add_callable_to_manifest(f"func:{ref}", value, manifest, visited)
+        _add_callable_to_manifest(f"func:{_callable_ref(value, ref)}", value, manifest, visited)
 
 
 def _sort_key(value: Any) -> tuple[str, str]:
@@ -1529,7 +1572,9 @@ def _process_module_dependency(
     for mod_name, attr_name in attrs:
         if mod_name not in (name, module_name):
             continue
-        key = f"mod:{mod_name}.{attr_name}"
+        # Key on the module's real name, not the local alias: two modules imported as `base`
+        # in different files would otherwise share a key.
+        key = f"mod:{module_name}.{attr_name}"
         if key in manifest:
             continue
         try:
@@ -1553,7 +1598,7 @@ def _process_module_dependency(
             # `_check_mutable_capture`; tuple/frozenset that nest mutable state or an
             # unsupported element trigger `_check_immutable_collection_capture`; pure-primitive
             # immutable collections are content-hashed. Both honor `unsafe_fingerprinting`.
-            attr_ref = f"{mod_name}.{attr_name}"
+            attr_ref = f"{module_name}.{attr_name}"
             collection = cast(
                 "dict[Any, Any] | list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]",
                 attr_value,
