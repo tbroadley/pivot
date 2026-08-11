@@ -35,6 +35,7 @@ Documented learnings from bugs, design decisions, and implementation patterns. C
 | [Test Helpers Must Be Module-Level](2026-02-01-test-helpers-must-be-module-level.md) | 2026-02-01 | Fingerprinting requires module-level test helpers |
 | [Skip Detection Invariants](2026-02-08-skip-detection-invariants.md) | 2026-02-08 | Three-tier skip detection algorithm invariants |
 | [Marshalled Code Objects Embed an Absolute Path](2026-08-05-marshalled-code-embeds-absolute-path.md) | 2026-08-05 | `marshal.dumps(__code__)` made wrapped-function hashes machine-specific |
+| [Manifest Keys Collided Across Modules](2026-08-11-manifest-keys-collide-across-modules.md) | 2026-08-11 | Bare-name manifest keys let one module's symbol overwrite another's |
 
 ## Execution & Workers (loky)
 
