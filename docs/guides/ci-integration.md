@@ -57,6 +57,14 @@ pivot verify --allow-missing
 !!! note
     `--allow-missing` requires at least one remote to be configured. If no remotes exist, the command fails with an error.
 
+A dependency that is absent locally still has to be checked against *something*. Verify substitutes a hash for it, in this order:
+
+1. the hash the producing stage recorded for that artifact in its lock file;
+2. the hash in the `.pvt` file tracking it;
+3. the hash the consuming stage itself recorded.
+
+Only the first two can disagree with what the consumer recorded, so they are what makes an out-of-date consumer visible without its inputs on disk — a stage whose upstream was re-run without re-running it fails with `Input dependencies changed`, in CI as it would locally.
+
 ### JSON Output
 
 The `--json` flag produces structured output for programmatic consumption:

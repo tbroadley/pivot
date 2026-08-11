@@ -63,15 +63,18 @@ from pivot import (
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, track
+from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.types import (
+    FileHash,
+    HashInfo,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
     StageExplanation,
     TrackedFileInfo,
     TrackedFileStatus,
+    is_dir_hash,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +102,90 @@ def _discover_tracked_files(
     return tracked_files, tracked_trie
 
 
+def _resolve_producer_out(
+    dep: pathlib.Path, producers: dict[str, str]
+) -> tuple[str, str, str | None] | None:
+    """Resolve a dep to (producing stage, output path, relpath within that output).
+
+    relpath is None for an exact match, and the path within the output directory
+    when the dep is a file inside a directory output.
+    """
+    key = str(dep)
+    if key in producers:
+        return producers[key], key, None
+
+    for parent in dep.parents:
+        stage_name = producers.get(str(parent))
+        if stage_name is not None:
+            return stage_name, str(parent), str(dep.relative_to(parent))
+
+    return None
+
+
+def _hash_from_out(hash_info: HashInfo, relpath: str | None) -> HashInfo | None:
+    """Extract the hash for relpath from a recorded output hash."""
+    if relpath is None:
+        return hash_info
+    if not is_dir_hash(hash_info):
+        return None
+    for entry in hash_info["manifest"]:
+        if entry["relpath"] == relpath:
+            return FileHash(hash=entry["hash"])
+    return None
+
+
+def _discover_producer_hashes(
+    allow_missing: bool,
+    execution_order: list[str],
+    all_stages: dict[str, RegistryStageInfo],
+) -> dict[str, HashInfo] | None:
+    """Map each locally absent dep to the hash its producing stage recorded for it.
+
+    Without this, a dep that is absent locally is checked against the consumer's own
+    lock file, which can never disagree with itself. Only lock files of stages that
+    produce such a dep are read.
+    """
+    if not allow_missing:
+        return None
+
+    # DirectoryOut paths keep a trailing slash; pathlib comparisons never produce one.
+    producers = {
+        out_path.rstrip("/"): stage_name
+        for stage_name in execution_order
+        for out_path in all_stages[stage_name]["outs_paths"]
+    }
+
+    wanted = dict[str, list[tuple[str, str, str | None]]]()
+    for stage_name in execution_order:
+        for dep in all_stages[stage_name]["deps_paths"]:
+            dep_path = project.normalize_path(dep)
+            if dep_path.exists():
+                continue
+            resolved = _resolve_producer_out(dep_path, producers)
+            if resolved is None:
+                continue
+            producer, out_path, relpath = resolved
+            wanted.setdefault(producer, []).append((str(dep_path), out_path, relpath))
+
+    default_state_dir = config.get_state_dir()
+    producer_hashes = dict[str, HashInfo]()
+    for producer, entries in wanted.items():
+        state_dir = registry.get_stage_state_dir(all_stages[producer], default_state_dir)
+        lock_data = lock.StageLock(producer, lock.get_stages_dir(state_dir)).read()
+        if lock_data is None:
+            continue
+        out_hashes = {path.rstrip("/"): h for path, h in lock_data["output_hashes"].items()}
+        for dep, out_path, relpath in entries:
+            out_hash = out_hashes.get(out_path)
+            if out_hash is None:
+                continue
+            dep_hash = _hash_from_out(out_hash, relpath)
+            if dep_hash is not None:
+                producer_hashes[dep] = dep_hash
+
+    return producer_hashes
+
+
 def _get_explanations_in_parallel(
     execution_order: list[str],
     overrides: parameters.ParamsOverrides | None,
@@ -107,6 +194,7 @@ def _get_explanations_in_parallel(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    producer_hashes: dict[str, HashInfo] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing).
 
@@ -158,6 +246,7 @@ def _get_explanations_in_parallel(
                     allow_missing=allow_missing,
                     tracked_files=tracked_files,
                     tracked_trie=tracked_trie,
+                    producer_hashes=producer_hashes,
                     state_db=shared_state_dbs.get(stage_state_dir),
                 )
                 futures[future] = stage_name
@@ -228,7 +317,8 @@ def get_pipeline_explanations(
         all_stages: Dict mapping stage names to RegistryStageInfo.
         stage_registry: Registry used to ensure fingerprints are computed.
         force: If True, mark all stages as would run due to force flag.
-        allow_missing: If True, use .pvt hashes for missing dependency files.
+        allow_missing: If True, substitute recorded hashes (producing stage first,
+            then .pvt) for dependency files that are absent locally.
         graph: Optional bipartite graph from Engine. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
     """
@@ -257,6 +347,7 @@ def get_pipeline_explanations(
             allow_missing=allow_missing,
             tracked_files=tracked_files,
             tracked_trie=tracked_trie,
+            producer_hashes=_discover_producer_hashes(allow_missing, execution_order, all_stages),
         )
 
         # Preserve original order for staleness propagation
@@ -324,7 +415,8 @@ def get_pipeline_status(
         single_stage: If True, check only specified stages without dependencies.
         all_stages: Dict mapping stage names to RegistryStageInfo.
         stage_registry: Registry used to ensure fingerprints are computed.
-        allow_missing: If True, use .pvt hashes for missing dependency files.
+        allow_missing: If True, substitute recorded hashes (producing stage first,
+            then .pvt) for dependency files that are absent locally.
         graph: Optional bipartite graph. If provided, extracts stage DAG
             via get_stage_dag() instead of building a new one.
     """
@@ -352,6 +444,7 @@ def get_pipeline_status(
             allow_missing=allow_missing,
             tracked_files=tracked_files,
             tracked_trie=tracked_trie,
+            producer_hashes=_discover_producer_hashes(allow_missing, execution_order, all_stages),
         )
 
         # Preserve original order for staleness propagation
