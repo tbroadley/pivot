@@ -1,5 +1,5 @@
 ARG PYTHON_VERSION=3.13.9
-ARG UV_VERSION=0.9.18
+ARG UV_VERSION=0.13.4
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM python:${PYTHON_VERSION}-bookworm AS python
